@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 export default function GPRadar() {
   const [data, setData] = useState([]);
+  const [expanded, setExpanded] = useState({});
 
   useEffect(() => {
     fetch("https://pm-deal-radar-1-production.up.railway.app/events")
@@ -10,95 +11,79 @@ export default function GPRadar() {
       .catch(console.error);
   }, []);
 
+  const toggle = (i) => {
+    setExpanded(prev => ({ ...prev, [i]: !prev[i] }));
+  };
+
   return (
     <div style={page}>
       <h1 style={title}>🌍 GP Activity Intelligence</h1>
 
-      {data.map((gp, i) => (
-        <div key={i} style={gpCard}>
+      {data.map((gp, i) => {
+        const isActive = (gp.activity_count || 0) > 1;
 
-          {/* HEADER */}
-          <div style={gpHeader}>
-            <div style={gpName}>{gp.entity}</div>
-            <div style={activityCount}>{gp.activity_count} events</div>
-          </div>
+        return (
+          <div key={i} style={{ ...gpCard, border: isActive ? "2px solid #2563eb" : "1px solid #e5e7eb" }}>
 
-          {/* TIME CLUSTERS */}
-          <div style={activityRow}>
-            <Activity label="🔥 6h" value={gp.activity.last_6h} color="#dc2626" />
-            <Activity label="🟠 24h" value={gp.activity.last_24h} color="#ea580c" />
-            <Activity label="⚪ 48h" value={gp.activity.last_48h} color="#6b7280" />
-          </div>
-
-          {/* EVENTS */}
-          <div style={eventsSection}>
-            {gp.events.map((e, idx) => (
-              <div key={idx} style={eventCard}>
-
-                <div style={eventMeta}>
-                  {e.event_type} | {e.source}
-                </div>
-
-                <div style={eventTitle}>
-                  {e.title}
-                </div>
-
-                <div style={summary}>
-                  {e.summary}
-                </div>
-
-                <a
-                  href={e.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={link}
-                >
-                  Open →
-                </a>
-
+            {/* HEADER */}
+            <div style={gpHeader} onClick={() => toggle(i)}>
+              <div>
+                <div style={gpName}>{gp.entity}</div>
+                <div style={sub}>{gp.activity_count} events</div>
               </div>
-            ))}
+              {isActive && <div style={badge}>Active</div>}
+            </div>
+
+            {/* EVENTS (COLLAPSIBLE) */}
+            {expanded[i] && (
+              <div style={eventsGrid}>
+                {gp.events.map((e, idx) => (
+                  <div key={idx} style={card}>
+                    <div style={meta}>{formatType(e.event_type)} | {e.source}</div>
+                    <div style={eventTitle}>{e.title}</div>
+                    <a href={e.url} target="_blank" rel="noreferrer" style={link}>Open →</a>
+                  </div>
+                ))}
+              </div>
+            )}
+
           </div>
-
-        </div>
-      ))}
-
+        );
+      })}
     </div>
   );
 }
 
-// COMPONENTS
-
-function Activity({ label, value, color }) {
-  return (
-    <div style={{ ...activityBox, borderColor: color }}>
-      <div>{label}</div>
-      <div style={{ fontWeight: "bold" }}>{value}</div>
-    </div>
-  );
+function formatType(type) {
+  if (type === "FUND_LAUNCH") return "Fund Launch";
+  if (type === "FUND_CLOSE") return "Fund Close";
+  if (type === "STRUCTURE") return "SPV / Structure";
+  if (type === "INVESTMENT") return "Investment";
+  return "Other";
 }
 
 // STYLES
 
 const page = {
-  padding: 30,
+  padding: 24,
   background: "#f3f4f6",
-  minHeight: "100vh",
-  fontFamily: "Arial"
+  fontFamily: "Arial",
+  minHeight: "100vh"
 };
 
 const title = {
-  fontSize: 28,
+  fontSize: 26,
   fontWeight: "bold",
   marginBottom: 20
 };
 
 const gpCard = {
   background: "white",
-  padding: 20,
-  borderRadius: 10,
-  marginBottom: 20,
-  boxShadow: "0 4px 10px rgba(0,0,0,0.08)"
+  borderRadius: 8,
+  padding: 14,
+  marginBottom: 14,
+  cursor: "pointer",
+  boxShadow: "0 2px 6px rgba(0,0,0,0.06)"
 };
 
 const gpHeader = {
@@ -108,59 +93,45 @@ const gpHeader = {
 };
 
 const gpName = {
-  fontSize: 20,
+  fontSize: 18,
   fontWeight: "bold"
 };
 
-const activityCount = {
-  fontSize: 14,
+const sub = {
+  fontSize: 12,
   color: "#666"
 };
 
-const activityRow = {
-  display: "flex",
-  gap: 10,
-  marginTop: 10
-};
-
-const activityBox = {
-  flex: 1,
-  padding: 8,
-  border: "2px solid",
+const badge = {
+  background: "#dbeafe",
+  padding: "4px 8px",
   borderRadius: 6,
-  textAlign: "center",
   fontSize: 12
 };
 
-const eventsSection = {
-  marginTop: 15,
+const eventsGrid = {
+  marginTop: 10,
   display: "grid",
-  gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))",
+  gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
   gap: 10
 };
 
-const eventCard = {
+const card = {
+  background: "#fafafa",
   border: "1px solid #e5e7eb",
   padding: 10,
-  borderRadius: 6,
-  background: "#fafafa"
+  borderRadius: 6
 };
 
-const eventMeta = {
+const meta = {
   fontSize: 11,
-  color: "#666"
+  color: "#6b7280"
 };
 
 const eventTitle = {
+  marginTop: 4,
   fontWeight: "bold",
-  marginTop: 4,
   fontSize: 14
-};
-
-const summary = {
-  marginTop: 4,
-  fontSize: 12,
-  color: "#444"
 };
 
 const link = {
