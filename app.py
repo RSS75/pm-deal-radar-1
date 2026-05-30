@@ -1,12 +1,20 @@
+# ============================================================
+# GP ACTIVITY INTELLIGENCE ENGINE (FULL SYSTEM VERSION)
+# ============================================================
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import aiohttp
 import feedparser
-import requests
-import json
-import os
 import re
-from datetime import datetime, timedelta
 import time
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+# ============================================================
+# APP INIT
+# ============================================================
 
 app = FastAPI()
 
@@ -18,98 +26,204 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
+# ============================================================
 # CONFIG
-# =========================
-
-DATA_FILE = "data.json"
-UPDATE_INTERVAL = 300  # 5 minutes
+# ============================================================
 
 RSS_FEEDS = [
     "https://www.privateequityinternational.com/feed/",
-    "https://www.inframationnews.com/feed/"
+    "https://www.inframationnews.com/feed/",
 ]
 
 COMPANIES_HOUSE_API_KEY = "YOUR_KEY"
 
-KEYWORDS = ["fund", "investment", "acquire", "close", "spv"]
+KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle"]
 
-# =========================
-# HELPERS
-# =========================
+GLOBAL_LOOP_INTERVAL = 2.0
+MAX_STEP_RUNTIME = 1.5
+MAX_CACHE_SIZE = 200
+
+# ============================================================
+# ENGINE STATE
+# ============================================================
+
+class SourceState:
+    def __init__(self):
+        self.fail_count = 0
+        self.last_success = 0
+        self.disabled_until = 0
+
+class EngineState:
+    def __init__(self):
+        self.data: List[Dict] = []
+        self.queue: List[Dict] = []
+        self.step_index = 0
+        self.running = False
+        self.last_update = 0
+        self.sources = {
+            "rss": SourceState(),
+            "registry": SourceState()
+        }
+        self.metrics = {
+            "cycles": 0,
+            "events_processed": 0
+        }
+        self.errors = {}
+
+STATE = EngineState()
+
+# ============================================================
+# UTILITIES
+# ============================================================
 
 def now():
     return time.time()
 
-def is_valid(text):
-    return text and any(k in text.lower() for k in KEYWORDS)
+def log(msg):
+    print(f"[ENGINE] {msg}")
 
-def extract_entity(text):
+def is_valid(text: str) -> bool:
     try:
-        matches = re.findall(r"\b(?:[A-Z][a-z]+(?:\s|$)){1,4}", text)
-        return matches[0].strip() if matches else "Unknown"
+        return any(k in text.lower() for k in KEYWORDS)
+    except:
+        return False
+
+def extract_entity(text: str) -> str:
+    try:
+        match = re.findall(r"\b(?:[A-Z][a-z]+(?:\s|$)){1,4}", text)
+        return match[0].strip() if match else "Unknown"
     except:
         return "Unknown"
 
-# =========================
-# DATA FETCH (CONTROLLED)
-# =========================
+def classify(text: str) -> str:
+    t = text.lower()
+    if "fund" in t: return "FUND"
+    if "investment" in t: return "INVESTMENT"
+    if "spv" in t: return "STRUCTURE"
+    return "OTHER"
 
-def fetch_data():
-    raw = []
+# ============================================================
+# SOURCE CONTROL (CIRCUIT BREAKER)
+# ============================================================
 
-    # ✅ RSS (fast)
-    for url in RSS_FEEDS:
-        try:
+def can_run(source_name):
+    src = STATE.sources[source_name]
+    if src.disabled_until > now():
+        return False
+    return True
+
+def record_success(source_name):
+    src = STATE.sources[source_name]
+    src.fail_count = 0
+    src.last_success = now()
+
+def record_failure(source_name):
+    src = STATE.sources[source_name]
+    src.fail_count += 1
+
+    if src.fail_count >= 3:
+        src.disabled_until = now() + 30
+        log(f"{source_name} disabled for 30 seconds")
+
+# ============================================================
+# SOURCE: RSS
+# ============================================================
+
+async def fetch_rss():
+    results = []
+
+    if not can_run("rss"):
+        return results
+
+    try:
+        for url in RSS_FEEDS:
+
             feed = feedparser.parse(url)
 
-            for e in feed.entries[:5]:
+            for e in feed.entries[:4]:
                 text = (e.title or "") + " " + (e.get("summary", "") or "")
 
                 if not is_valid(text):
                     continue
 
-                raw.append({
+                results.append({
                     "title": e.title,
                     "text": text,
                     "url": e.link,
                     "source": "NEWS"
                 })
 
-        except:
-            continue
+        record_success("rss")
 
-    # ✅ Registry (very limited)
+    except Exception as e:
+        STATE.errors["rss"] = str(e)
+        record_failure("rss")
+
+    return results
+
+# ============================================================
+# SOURCE: REGISTRY
+# ============================================================
+
+async def fetch_registry(session):
+    results = []
+
+    if not can_run("registry"):
+        return results
+
     try:
-        r = requests.get(
+        async with session.get(
             "https://api.company-information.service.gov.uk/search/companies?q=fund",
-            timeout=2,
-            auth=(COMPANIES_HOUSE_API_KEY, "")
-        )
+            auth=aiohttp.BasicAuth(COMPANIES_HOUSE_API_KEY, ""),
+            timeout=aiohttp.ClientTimeout(total=2)
+        ) as resp:
 
-        if r.status_code == 200:
-            items = r.json().get("items", [])
+            if resp.status != 200:
+                raise Exception("Bad response")
 
-            for i in items[:3]:
-                title = i.get("title", "")
+            data = await resp.json()
+
+            for item in data.get("items", [])[:3]:
+                title = item.get("title", "")
 
                 if not is_valid(title):
                     continue
 
-                raw.append({
+                results.append({
                     "title": f"Registry: {title}",
                     "text": title,
-                    "url": "https://find-and-update.company-information.service.gov.uk/company/" + i.get("company_number", ""),
+                    "url": "https://find-and-update.company-information.service.gov.uk/company/" + item.get("company_number", ""),
                     "source": "REGISTRY"
                 })
 
-    except:
-        pass
+        record_success("registry")
 
-    # ✅ GROUP
+    except Exception as e:
+        STATE.errors["registry"] = str(e)
+        record_failure("registry")
+
+    return results
+
+# ============================================================
+# PROCESSING PIPELINE
+# ============================================================
+
+def deduplicate(events):
+    seen = set()
+    out = []
+
+    for e in events:
+        key = e["title"][:80]
+        if key not in seen:
+            seen.add(key)
+            out.append(e)
+
+    return out
+
+def aggregate(events):
     grouped = {}
 
-    for e in raw:
+    for e in events:
         entity = extract_entity(e["text"])
 
         if entity not in grouped:
@@ -119,50 +233,108 @@ def fetch_data():
                 "activity_count": 0
             }
 
-        grouped[entity]["events"].append(e)
+        grouped[entity]["events"].append({
+            **e,
+            "event_type": classify(e["text"])
+        })
+
         grouped[entity]["activity_count"] += 1
 
     return list(grouped.values())
 
-# =========================
-# FILE CACHE LOGIC
-# =========================
+# ============================================================
+# ENGINE EXECUTION STEPS
+# ============================================================
 
-def needs_update():
-    if not os.path.exists(DATA_FILE):
-        return True
+async def execute_step(session):
 
-    last_modified = os.path.getmtime(DATA_FILE)
-    return now() - last_modified > UPDATE_INTERVAL
+    step = STATE.step_index % 2
+    STATE.step_index += 1
 
-def get_data():
+    if step == 0:
+        return await fetch_rss()
+    else:
+        return await fetch_registry(session)
 
-    # ✅ update if needed
-    if needs_update():
-        try:
-            data = fetch_data()
+# ============================================================
+# MAIN ENGINE LOOP
+# ============================================================
 
-            with open(DATA_FILE, "w") as f:
-                json.dump(data, f)
+async def engine_loop():
 
-        except:
-            pass  # silently fail
+    if STATE.running:
+        return
 
-    # ✅ serve existing data
+    STATE.running = True
+
+    session = aiohttp.ClientSession()
+
+    log("Engine started")
+
     try:
-        with open(DATA_FILE) as f:
-            return json.load(f)
-    except:
-        return []
+        while True:
 
-# =========================
-# API
-# =========================
+            cycle_start = now()
+            step_data = []
+
+            try:
+                step_data = await execute_step(session)
+            except Exception as e:
+                STATE.errors["engine_step"] = str(e)
+
+            # queue accumulation
+            STATE.queue.extend(step_data)
+
+            # bounded processing
+            if len(STATE.queue) > 0:
+
+                combined = STATE.data + STATE.queue
+                combined = deduplicate(combined)
+
+                STATE.data = aggregate(combined)[
+                    :50
+                ]  # memory limit
+
+                STATE.queue = []
+                STATE.last_update = now()
+
+                STATE.metrics["events_processed"] += len(step_data)
+
+            STATE.metrics["cycles"] += 1
+
+            elapsed = now() - cycle_start
+
+            # enforce time budget
+            if elapsed < MAX_STEP_RUNTIME:
+                await asyncio.sleep(MAX_STEP_RUNTIME - elapsed)
+
+            await asyncio.sleep(GLOBAL_LOOP_INTERVAL)
+
+    finally:
+        await session.close()
+
+# ============================================================
+# START ENGINE
+# ============================================================
+
+@app.on_event("startup")
+async def start_engine():
+    asyncio.create_task(engine_loop())
+
+# ============================================================
+# API LAYER
+# ============================================================
 
 @app.get("/")
 def root():
-    return {"status": "running"}
+    return {
+        "status": "running",
+        "last_update": STATE.last_update,
+        "events": len(STATE.data),
+        "metrics": STATE.metrics,
+        "errors": STATE.errors
+    }
 
 @app.get("/events")
 def events():
-    return get_data()
+    return STATE.data
