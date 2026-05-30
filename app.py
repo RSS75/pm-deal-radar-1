@@ -5,6 +5,7 @@ import requests
 import re
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+import time
 
 app = FastAPI()
 
@@ -17,20 +18,33 @@ app.add_middleware(
 )
 
 # =========================
+# SIMPLE CACHE (REDIS-LIKE)
+# =========================
+
+CACHE = {}
+CACHE_TTL = 300  # 5 minutes
+
+def cache_get(key):
+    entry = CACHE.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["time"] > CACHE_TTL:
+        return None
+    return entry["data"]
+
+def cache_set(key, data):
+    CACHE[key] = {"data": data, "time": time.time()}
+
+# =========================
 # CONFIG
 # =========================
 
-COMPANIES_HOUSE_API_KEY = "YOUR_KEY"
 KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle", "financing"]
 
 RSS_FEEDS = [
     "https://www.privateequityinternational.com/feed/",
     "https://www.inframationnews.com/feed/"
 ]
-
-# Global registry proxies (STABLE RSS)
-LUX_RSS = "https://www.cssf.lu/en/rss/"
-IRELAND_RSS = "https://www.centralbank.ie/news/rss"
 
 # =========================
 # UTIL
@@ -50,9 +64,7 @@ def parse_iso(ts):
 
 def is_recent(ts):
     dt = parse_iso(ts)
-    if not dt:
-        return False
-    return datetime.utcnow() - dt <= timedelta(hours=48)
+    return dt and (datetime.utcnow() - dt <= timedelta(hours=48))
 
 def is_valid(text):
     return text and any(k in text.lower() for k in KEYWORDS)
@@ -64,16 +76,9 @@ def is_valid(text):
 def normalize_entity(name):
     name = name.strip()
 
-    # collapse long names → core identity
-    replacements = [
-        ("Capital Partners", "Capital"),
-        ("Infrastructure Partners", "Infrastructure"),
-        ("Private Equity", ""),
-        ("Holdings", "")
-    ]
-
-    for k, v in replacements:
-        name = name.replace(k, v)
+    cleanup = ["Partners", "Capital", "Group", "Holdings", "Management"]
+    for c in cleanup:
+        name = name.replace(c, "")
 
     return name.strip()
 
@@ -82,13 +87,8 @@ def extract_entity(text):
         matches = re.findall(r"\b(?:[A-Z][a-z]+(?:\s|$)){1,4}", text)
         candidates = [m.strip() for m in matches if len(m.strip()) > 2]
 
-        GP_HINTS = [
-            "capital", "partners", "equity", "ventures",
-            "infrastructure", "real estate", "group"
-        ]
-
         for c in candidates:
-            if any(h in c.lower() for h in GP_HINTS):
+            if any(x in c.lower() for x in ["capital", "partners", "equity", "ventures", "group"]):
                 return normalize_entity(c)
 
         return normalize_entity(candidates[0]) if candidates else "Unknown"
@@ -97,34 +97,34 @@ def extract_entity(text):
         return "Unknown"
 
 # =========================
-# CLASSIFY
+# CLASSIFICATION
 # =========================
 
 def classify(text):
-    try:
-        t = text.lower()
+    t = text.lower()
 
-        if "fund" in t and ("launch" in t or "raise" in t):
-            return "FUND_LAUNCH"
-        if "close" in t:
-            return "FUND_CLOSE"
-        if "spv" in t or "vehicle" in t:
-            return "STRUCTURE"
-        if "acquire" in t or "investment" in t:
-            return "INVESTMENT"
-        if "debt" in t or "financing" in t:
-            return "FINANCING"
+    if "fund" in t and ("launch" in t or "raise" in t):
+        return "FUND_LAUNCH"
+    if "close" in t:
+        return "FUND_CLOSE"
+    if "spv" in t:
+        return "STRUCTURE"
+    if "acquire" in t or "investment" in t:
+        return "INVESTMENT"
+    if "financing" in t:
+        return "FINANCING"
 
-        return "OTHER"
-
-    except:
-        return "OTHER"
+    return "OTHER"
 
 # =========================
-# SOURCE: RSS NEWS
+# SOURCE: RSS (CACHED)
 # =========================
 
 def fetch_rss():
+    cached = cache_get("rss")
+    if cached:
+        return cached
+
     out = []
 
     for url in RSS_FEEDS:
@@ -138,6 +138,7 @@ def fetch_rss():
                     continue
 
                 ts = safe_time(dt)
+
                 if not is_recent(ts):
                     continue
 
@@ -158,89 +159,18 @@ def fetch_rss():
         except:
             continue
 
+    cache_set("rss", out)
     return out
 
 # =========================
-# SOURCE: COMPANIES HOUSE
-# =========================
-
-def fetch_uk_registry():
-    out = []
-
-    try:
-        r = requests.get(
-            "https://api.company-information.service.gov.uk/search/companies?q=fund",
-            auth=(COMPANIES_HOUSE_API_KEY, ""),
-            timeout=5
-        )
-
-        items = r.json().get("items", [])
-
-        for i in items[:10]:
-            title = i.get("title", "")
-
-            if not is_valid(title):
-                continue
-
-            out.append({
-                "title": f"UK Registry: {title}",
-                "text": title,
-                "url": "https://find-and-update.company-information.service.gov.uk/company/" + i.get("company_number", ""),
-                "summary": "UK fund/SPV registration",
-                "source": "REGISTRY_UK",
-                "timestamp": safe_time(datetime.utcnow())
-            })
-
-    except:
-        pass
-
-    return out
-
-# =========================
-# SOURCE: LUX + IRELAND
-# =========================
-
-def fetch_registry_rss(url, label):
-    out = []
-
-    try:
-        feed = feedparser.parse(url)
-
-        for e in feed.entries[:10]:
-            try:
-                dt = datetime(*e.published_parsed[:6])
-            except:
-                continue
-
-            ts = safe_time(dt)
-
-            if not is_recent(ts):
-                continue
-
-            text = e.title or ""
-
-            if not is_valid(text):
-                continue
-
-            out.append({
-                "title": e.title,
-                "text": text,
-                "url": e.link,
-                "summary": f"{label} registry signal",
-                "source": label,
-                "timestamp": ts
-            })
-
-    except:
-        pass
-
-    return out
-
-# =========================
-# SOURCE: SEC EDGAR (REAL SAFE SCRAPE)
+# SOURCE: SEC EDGAR (SAFE)
 # =========================
 
 def fetch_sec():
+    cached = cache_get("sec")
+    if cached:
+        return cached
+
     out = []
 
     try:
@@ -252,10 +182,8 @@ def fetch_sec():
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        rows = soup.find_all("tr")
-
-        for r in rows[:20]:
-            text = r.get_text(" ", strip=True)
+        for row in soup.find_all("tr")[:20]:
+            text = row.get_text()
 
             if "D" not in text:
                 continue
@@ -267,7 +195,7 @@ def fetch_sec():
                 "title": text[:120],
                 "text": text,
                 "url": "https://www.sec.gov",
-                "summary": "SEC Form D filing",
+                "summary": "SEC Form D",
                 "source": "SEC",
                 "timestamp": safe_time(datetime.utcnow())
             })
@@ -275,13 +203,18 @@ def fetch_sec():
     except:
         pass
 
+    cache_set("sec", out)
     return out
 
 # =========================
-# PREQIN
+# SOURCE: PREQIN (SAFE)
 # =========================
 
 def fetch_preqin():
+    cached = cache_get("preqin")
+    if cached:
+        return cached
+
     out = []
 
     try:
@@ -307,21 +240,42 @@ def fetch_preqin():
     except:
         pass
 
+    cache_set("preqin", out)
     return out
 
 # =========================
-# PIPELINE
+# DEDUP: ENTITY + TEXT
 # =========================
 
 def dedupe(events):
     seen = set()
     out = []
+
     for e in events:
-        k = e.get("title", "")
-        if k and k not in seen:
-            seen.add(k)
+        key = (e.get("entity"), e.get("title", "")[:50])
+
+        if key not in seen:
+            seen.add(key)
             out.append(e)
+
     return out
+
+# =========================
+# ALERT ENGINE
+# =========================
+
+def assign_alert(g):
+    if g["activity"]["last_6h"] >= 2:
+        return "HIGH"
+    if g["activity"]["last_24h"] >= 3:
+        return "MEDIUM"
+    if g["activity"]["last_48h"] >= 4:
+        return "LOW"
+    return None
+
+# =========================
+# GROUPING
+# =========================
 
 def group(events):
     g = {}
@@ -354,6 +308,10 @@ def group(events):
         g[entity]["activity_count"] += 1
         g[entity]["events"].append(e)
 
+    # add alerts
+    for entity in g.values():
+        entity["alert"] = assign_alert(entity)
+
     return sorted(
         g.values(),
         key=lambda x: (x["activity"]["last_6h"], x["activity"]["last_24h"]),
@@ -361,21 +319,17 @@ def group(events):
     )
 
 # =========================
-# MAIN
+# MAIN API
 # =========================
 
 @app.get("/events")
 def get_events():
+
     try:
         raw = []
         raw += fetch_rss()
-        raw += fetch_uk_registry()
-        raw += fetch_registry_rss(LUX_RSS, "REGISTRY_LUX")
-        raw += fetch_registry_rss(IRELAND_RSS, "REGISTRY_IE")
         raw += fetch_sec()
         raw += fetch_preqin()
-
-        raw = dedupe(raw)
 
         processed = []
 
@@ -389,7 +343,10 @@ def get_events():
                 "event_type": classify(e["text"])
             })
 
+        processed = dedupe(processed)
+
         return group(processed)
 
-    except:
+    except Exception as e:
+        print("ERROR:", e)
         return []
