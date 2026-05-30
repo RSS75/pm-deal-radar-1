@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
+import requests
 import re
 from datetime import datetime, timedelta
 import time
@@ -20,7 +21,10 @@ app.add_middleware(
 # =========================
 
 CACHE = {"data": [], "timestamp": 0}
-CACHE_TTL = 300  # 5 min
+CACHE_TTL = 300  # 5 minutes
+
+REGISTRY_CACHE = {"data": [], "timestamp": 0}
+REGISTRY_TTL = 60  # 1 minute
 
 # =========================
 # CONFIG
@@ -30,6 +34,8 @@ RSS_FEEDS = [
     "https://www.privateequityinternational.com/feed/",
     "https://www.inframationnews.com/feed/"
 ]
+
+COMPANIES_HOUSE_API_KEY = "YOUR_KEY_HERE"
 
 KEYWORDS = ["fund", "investment", "acquire", "close", "spv"]
 
@@ -60,7 +66,7 @@ def is_valid(text):
     return text and any(k in text.lower() for k in KEYWORDS)
 
 # =========================
-# ENTITY
+# ENTITY EXTRACTION
 # =========================
 
 def extract_entity(text):
@@ -71,7 +77,7 @@ def extract_entity(text):
         return "Unknown"
 
 # =========================
-# CLASSIFY
+# CLASSIFICATION
 # =========================
 
 def classify(text):
@@ -89,7 +95,18 @@ def classify(text):
     return "OTHER"
 
 # =========================
-# RSS ONLY (SAFE)
+# SAFE FETCH WRAPPER
+# =========================
+
+def safe_fetch(fn):
+    try:
+        return fn()
+    except Exception as e:
+        print(f"{fn.__name__} failed:", e)
+        return []
+
+# =========================
+# SOURCE 1: RSS (CORE)
 # =========================
 
 def fetch_rss():
@@ -99,8 +116,7 @@ def fetch_rss():
         try:
             feed = feedparser.parse(url)
 
-            # 🔥 VERY small sample (critical)
-            for e in feed.entries[:5]:
+            for e in feed.entries[:5]:  # very limited
 
                 try:
                     dt = datetime(*e.published_parsed[:6])
@@ -131,6 +147,61 @@ def fetch_rss():
     return out
 
 # =========================
+# SOURCE 2: REGISTRY (SAFE + LIMITED)
+# =========================
+
+def fetch_registry():
+    out = []
+
+    try:
+        r = requests.get(
+            "https://api.company-information.service.gov.uk/search/companies?q=fund",
+            timeout=2,
+            auth=(COMPANIES_HOUSE_API_KEY, "")
+        )
+
+        if r.status_code != 200:
+            return []
+
+        items = r.json().get("items", [])
+
+        for i in items[:3]:  # very limited
+            title = i.get("title", "")
+
+            if not is_valid(title):
+                continue
+
+            out.append({
+                "title": f"Registry: {title}",
+                "text": title,
+                "url": f"https://find-and-update.company-information.service.gov.uk/company/{i.get('company_number')}",
+                "source": "REGISTRY",
+                "timestamp": safe_iso(datetime.utcnow())
+            })
+
+    except:
+        pass
+
+    return out
+
+# =========================
+# REGISTRY CACHE CONTROL
+# =========================
+
+def get_registry_data():
+    global REGISTRY_CACHE
+
+    if now() - REGISTRY_CACHE["timestamp"] < REGISTRY_TTL:
+        return REGISTRY_CACHE["data"]
+
+    data = safe_fetch(fetch_registry)
+
+    REGISTRY_CACHE["data"] = data
+    REGISTRY_CACHE["timestamp"] = now()
+
+    return data
+
+# =========================
 # GROUP
 # =========================
 
@@ -153,11 +224,14 @@ def group(events):
     return list(grouped.values())
 
 # =========================
-# MAIN
+# MAIN PIPELINE
 # =========================
 
 def refresh_data():
-    raw = fetch_rss()
+    raw = []
+
+    raw += safe_fetch(fetch_rss)          # fast
+    raw += get_registry_data()            # throttled (1/min)
 
     processed = []
 
@@ -177,14 +251,17 @@ def refresh_data():
 # API
 # =========================
 
+@app.get("/")
+def root():
+    return {"status": "running"}
+
 @app.get("/events")
 def get_events():
+
     try:
-        # ✅ cache hit
         if now() - CACHE["timestamp"] < CACHE_TTL:
             return CACHE["data"]
 
-        # ✅ refresh (LIGHT)
         data = refresh_data()
 
         CACHE["data"] = data
@@ -192,5 +269,6 @@ def get_events():
 
         return data
 
-    except:
+    except Exception as e:
+        print("CRITICAL ERROR:", e)
         return CACHE["data"]
