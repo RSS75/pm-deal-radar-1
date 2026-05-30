@@ -18,39 +18,21 @@ app.add_middleware(
 )
 
 # =========================
-# SIMPLE CACHE (REDIS-LIKE)
-# =========================
-
-CACHE = {}
-CACHE_TTL = 300  # 5 minutes
-
-def cache_get(key):
-    entry = CACHE.get(key)
-    if not entry:
-        return None
-    if time.time() - entry["time"] > CACHE_TTL:
-        return None
-    return entry["data"]
-
-def cache_set(key, data):
-    CACHE[key] = {"data": data, "time": time.time()}
-
-# =========================
 # CONFIG
 # =========================
-
-KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle", "financing"]
 
 RSS_FEEDS = [
     "https://www.privateequityinternational.com/feed/",
     "https://www.inframationnews.com/feed/"
 ]
 
+KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle"]
+
 # =========================
-# UTIL
+# SAFE HELPERS
 # =========================
 
-def safe_time(dt):
+def safe_iso(dt):
     try:
         return dt.isoformat()
     except:
@@ -70,215 +52,142 @@ def is_valid(text):
     return text and any(k in text.lower() for k in KEYWORDS)
 
 # =========================
-# ENTITY EXTRACTION + NORMALISATION
+# ENTITY EXTRACTION
 # =========================
-
-def normalize_entity(name):
-    name = name.strip()
-
-    cleanup = ["Partners", "Capital", "Group", "Holdings", "Management"]
-    for c in cleanup:
-        name = name.replace(c, "")
-
-    return name.strip()
 
 def extract_entity(text):
     try:
         matches = re.findall(r"\b(?:[A-Z][a-z]+(?:\s|$)){1,4}", text)
-        candidates = [m.strip() for m in matches if len(m.strip()) > 2]
-
-        for c in candidates:
-            if any(x in c.lower() for x in ["capital", "partners", "equity", "ventures", "group"]):
-                return normalize_entity(c)
-
-        return normalize_entity(candidates[0]) if candidates else "Unknown"
-
+        return matches[0].strip() if matches else "Unknown"
     except:
         return "Unknown"
 
 # =========================
-# CLASSIFICATION
+# CLASSIFY
 # =========================
 
 def classify(text):
     t = text.lower()
-
     if "fund" in t and ("launch" in t or "raise" in t):
         return "FUND_LAUNCH"
     if "close" in t:
         return "FUND_CLOSE"
     if "spv" in t:
         return "STRUCTURE"
-    if "acquire" in t or "investment" in t:
+    if "investment" in t:
         return "INVESTMENT"
-    if "financing" in t:
-        return "FINANCING"
-
     return "OTHER"
 
 # =========================
-# SOURCE: RSS (CACHED)
+# SAFE FETCH WRAPPER (CRITICAL)
+# =========================
+
+def safe_fetch(fn):
+    try:
+        return fn()
+    except Exception as e:
+        print(f"{fn.__name__} failed:", e)
+        return []
+
+# =========================
+# SOURCES
 # =========================
 
 def fetch_rss():
-    cached = cache_get("rss")
-    if cached:
-        return cached
-
     out = []
 
     for url in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
+        feed = feedparser.parse(url)
 
-            for e in feed.entries:
-                try:
-                    dt = datetime(*e.published_parsed[:6])
-                except:
-                    continue
-
-                ts = safe_time(dt)
-
-                if not is_recent(ts):
-                    continue
-
-                text = (e.title or "") + " " + (e.get("summary", "") or "")
-
-                if not is_valid(text):
-                    continue
-
-                out.append({
-                    "title": e.title,
-                    "text": text,
-                    "url": e.link,
-                    "summary": e.get("summary", ""),
-                    "source": "NEWS",
-                    "timestamp": ts
-                })
-
-        except:
-            continue
-
-    cache_set("rss", out)
-    return out
-
-# =========================
-# SOURCE: SEC EDGAR (SAFE)
-# =========================
-
-def fetch_sec():
-    cached = cache_get("sec")
-    if cached:
-        return cached
-
-    out = []
-
-    try:
-        r = requests.get(
-            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5
-        )
-
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for row in soup.find_all("tr")[:20]:
-            text = row.get_text()
-
-            if "D" not in text:
+        for e in feed.entries[:10]:  # LIMIT LOAD
+            try:
+                dt = datetime(*e.published_parsed[:6])
+            except:
                 continue
+
+            ts = safe_iso(dt)
+
+            if not is_recent(ts):
+                continue
+
+            text = (e.title or "") + " " + (e.get("summary", "") or "")
 
             if not is_valid(text):
                 continue
 
             out.append({
-                "title": text[:120],
+                "title": e.title,
                 "text": text,
-                "url": "https://www.sec.gov",
-                "summary": "SEC Form D",
-                "source": "SEC",
-                "timestamp": safe_time(datetime.utcnow())
+                "url": e.link,
+                "source": "NEWS",
+                "timestamp": ts
             })
 
-    except:
-        pass
-
-    cache_set("sec", out)
     return out
 
-# =========================
-# SOURCE: PREQIN (SAFE)
-# =========================
 
 def fetch_preqin():
-    cached = cache_get("preqin")
-    if cached:
-        return cached
-
     out = []
 
-    try:
-        r = requests.get("https://www.preqin.com/insights", timeout=5)
+    r = requests.get(
+        "https://www.preqin.com/insights",
+        timeout=3,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
 
-        soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(r.text, "html.parser")
 
-        for a in soup.find_all("a")[:15]:
-            title = a.get_text(strip=True)
+    for a in soup.find_all("a")[:10]:
+        title = a.get_text(strip=True)
 
-            if not title or not is_valid(title):
-                continue
+        if not title or not is_valid(title):
+            continue
 
-            out.append({
-                "title": title,
-                "text": title,
-                "url": a.get("href") or "",
-                "summary": "Preqin signal",
-                "source": "PREQIN",
-                "timestamp": safe_time(datetime.utcnow())
-            })
-
-    except:
-        pass
-
-    cache_set("preqin", out)
-    return out
-
-# =========================
-# DEDUP: ENTITY + TEXT
-# =========================
-
-def dedupe(events):
-    seen = set()
-    out = []
-
-    for e in events:
-        key = (e.get("entity"), e.get("title", "")[:50])
-
-        if key not in seen:
-            seen.add(key)
-            out.append(e)
+        out.append({
+            "title": title,
+            "text": title,
+            "url": a.get("href") or "",
+            "source": "PREQIN",
+            "timestamp": safe_iso(datetime.utcnow())
+        })
 
     return out
 
-# =========================
-# ALERT ENGINE
-# =========================
 
-def assign_alert(g):
-    if g["activity"]["last_6h"] >= 2:
-        return "HIGH"
-    if g["activity"]["last_24h"] >= 3:
-        return "MEDIUM"
-    if g["activity"]["last_48h"] >= 4:
-        return "LOW"
-    return None
+def fetch_sec():
+    out = []
+
+    r = requests.get(
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent",
+        timeout=3,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    for row in soup.find_all("tr")[:10]:
+        text = row.get_text()
+
+        if "D" not in text or not is_valid(text):
+            continue
+
+        out.append({
+            "title": text[:100],
+            "text": text,
+            "url": "https://www.sec.gov",
+            "source": "SEC",
+            "timestamp": safe_iso(datetime.utcnow())
+        })
+
+    return out
+
 
 # =========================
 # GROUPING
 # =========================
 
 def group(events):
-    g = {}
+    grouped = {}
     now = datetime.utcnow()
 
     for e in events:
@@ -288,38 +197,28 @@ def group(events):
 
         entity = e["entity"]
 
-        if entity not in g:
-            g[entity] = {
+        if entity not in grouped:
+            grouped[entity] = {
                 "entity": entity,
                 "activity": {"last_6h":0,"last_24h":0,"last_48h":0},
-                "activity_count":0,
                 "events":[]
             }
 
         diff = now - ts
 
         if diff <= timedelta(hours=48):
-            g[entity]["activity"]["last_48h"] += 1
+            grouped[entity]["activity"]["last_48h"] += 1
         if diff <= timedelta(hours=24):
-            g[entity]["activity"]["last_24h"] += 1
+            grouped[entity]["activity"]["last_24h"] += 1
         if diff <= timedelta(hours=6):
-            g[entity]["activity"]["last_6h"] += 1
+            grouped[entity]["activity"]["last_6h"] += 1
 
-        g[entity]["activity_count"] += 1
-        g[entity]["events"].append(e)
+        grouped[entity]["events"].append(e)
 
-    # add alerts
-    for entity in g.values():
-        entity["alert"] = assign_alert(entity)
-
-    return sorted(
-        g.values(),
-        key=lambda x: (x["activity"]["last_6h"], x["activity"]["last_24h"]),
-        reverse=True
-    )
+    return list(grouped.values())
 
 # =========================
-# MAIN API
+# MAIN
 # =========================
 
 @app.get("/events")
@@ -327,9 +226,9 @@ def get_events():
 
     try:
         raw = []
-        raw += fetch_rss()
-        raw += fetch_sec()
-        raw += fetch_preqin()
+        raw += safe_fetch(fetch_rss)
+        raw += safe_fetch(fetch_preqin)
+        raw += safe_fetch(fetch_sec)
 
         processed = []
 
@@ -343,10 +242,8 @@ def get_events():
                 "event_type": classify(e["text"])
             })
 
-        processed = dedupe(processed)
-
         return group(processed)
 
     except Exception as e:
-        print("ERROR:", e)
+        print("CRITICAL ERROR:", e)
         return []
