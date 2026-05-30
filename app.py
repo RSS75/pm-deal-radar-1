@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
 import requests
+import json
+import os
 import re
 from datetime import datetime, timedelta
 import time
@@ -17,25 +19,18 @@ app.add_middleware(
 )
 
 # =========================
-# CACHE
-# =========================
-
-CACHE = {"data": [], "timestamp": 0}
-CACHE_TTL = 300  # 5 minutes
-
-REGISTRY_CACHE = {"data": [], "timestamp": 0}
-REGISTRY_TTL = 60  # 1 minute
-
-# =========================
 # CONFIG
 # =========================
+
+DATA_FILE = "data.json"
+UPDATE_INTERVAL = 300  # 5 minutes
 
 RSS_FEEDS = [
     "https://www.privateequityinternational.com/feed/",
     "https://www.inframationnews.com/feed/"
 ]
 
-COMPANIES_HOUSE_API_KEY = "YOUR_KEY_HERE"
+COMPANIES_HOUSE_API_KEY = "YOUR_KEY"
 
 KEYWORDS = ["fund", "investment", "acquire", "close", "spv"]
 
@@ -46,28 +41,8 @@ KEYWORDS = ["fund", "investment", "acquire", "close", "spv"]
 def now():
     return time.time()
 
-def safe_iso(dt):
-    try:
-        return dt.isoformat()
-    except:
-        return datetime.utcnow().isoformat()
-
-def parse_iso(ts):
-    try:
-        return datetime.fromisoformat(ts)
-    except:
-        return None
-
-def is_recent(ts):
-    dt = parse_iso(ts)
-    return dt and (datetime.utcnow() - dt <= timedelta(hours=48))
-
 def is_valid(text):
     return text and any(k in text.lower() for k in KEYWORDS)
-
-# =========================
-# ENTITY EXTRACTION
-# =========================
 
 def extract_entity(text):
     try:
@@ -77,82 +52,34 @@ def extract_entity(text):
         return "Unknown"
 
 # =========================
-# CLASSIFICATION
+# DATA FETCH (CONTROLLED)
 # =========================
 
-def classify(text):
-    t = text.lower()
+def fetch_data():
+    raw = []
 
-    if "fund" in t and ("launch" in t or "raise" in t):
-        return "FUND_LAUNCH"
-    if "close" in t:
-        return "FUND_CLOSE"
-    if "spv" in t:
-        return "STRUCTURE"
-    if "investment" in t:
-        return "INVESTMENT"
-
-    return "OTHER"
-
-# =========================
-# SAFE FETCH WRAPPER
-# =========================
-
-def safe_fetch(fn):
-    try:
-        return fn()
-    except Exception as e:
-        print(f"{fn.__name__} failed:", e)
-        return []
-
-# =========================
-# SOURCE 1: RSS (CORE)
-# =========================
-
-def fetch_rss():
-    out = []
-
+    # ✅ RSS (fast)
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
 
-            for e in feed.entries[:5]:  # very limited
-
-                try:
-                    dt = datetime(*e.published_parsed[:6])
-                except:
-                    continue
-
-                ts = safe_iso(dt)
-
-                if not is_recent(ts):
-                    continue
-
+            for e in feed.entries[:5]:
                 text = (e.title or "") + " " + (e.get("summary", "") or "")
 
                 if not is_valid(text):
                     continue
 
-                out.append({
+                raw.append({
                     "title": e.title,
                     "text": text,
                     "url": e.link,
-                    "source": "NEWS",
-                    "timestamp": ts
+                    "source": "NEWS"
                 })
 
         except:
             continue
 
-    return out
-
-# =========================
-# SOURCE 2: REGISTRY (SAFE + LIMITED)
-# =========================
-
-def fetch_registry():
-    out = []
-
+    # ✅ Registry (very limited)
     try:
         r = requests.get(
             "https://api.company-information.service.gov.uk/search/companies?q=fund",
@@ -160,62 +87,36 @@ def fetch_registry():
             auth=(COMPANIES_HOUSE_API_KEY, "")
         )
 
-        if r.status_code != 200:
-            return []
+        if r.status_code == 200:
+            items = r.json().get("items", [])
 
-        items = r.json().get("items", [])
+            for i in items[:3]:
+                title = i.get("title", "")
 
-        for i in items[:3]:  # very limited
-            title = i.get("title", "")
+                if not is_valid(title):
+                    continue
 
-            if not is_valid(title):
-                continue
-
-            out.append({
-                "title": f"Registry: {title}",
-                "text": title,
-                "url": f"https://find-and-update.company-information.service.gov.uk/company/{i.get('company_number')}",
-                "source": "REGISTRY",
-                "timestamp": safe_iso(datetime.utcnow())
-            })
+                raw.append({
+                    "title": f"Registry: {title}",
+                    "text": title,
+                    "url": "https://find-and-update.company-information.service.gov.uk/company/" + i.get("company_number", ""),
+                    "source": "REGISTRY"
+                })
 
     except:
         pass
 
-    return out
-
-# =========================
-# REGISTRY CACHE CONTROL
-# =========================
-
-def get_registry_data():
-    global REGISTRY_CACHE
-
-    if now() - REGISTRY_CACHE["timestamp"] < REGISTRY_TTL:
-        return REGISTRY_CACHE["data"]
-
-    data = safe_fetch(fetch_registry)
-
-    REGISTRY_CACHE["data"] = data
-    REGISTRY_CACHE["timestamp"] = now()
-
-    return data
-
-# =========================
-# GROUP
-# =========================
-
-def group(events):
+    # ✅ GROUP
     grouped = {}
 
-    for e in events:
-        entity = e["entity"]
+    for e in raw:
+        entity = extract_entity(e["text"])
 
         if entity not in grouped:
             grouped[entity] = {
                 "entity": entity,
-                "activity_count": 0,
-                "events": []
+                "events": [],
+                "activity_count": 0
             }
 
         grouped[entity]["events"].append(e)
@@ -224,28 +125,35 @@ def group(events):
     return list(grouped.values())
 
 # =========================
-# MAIN PIPELINE
+# FILE CACHE LOGIC
 # =========================
 
-def refresh_data():
-    raw = []
+def needs_update():
+    if not os.path.exists(DATA_FILE):
+        return True
 
-    raw += safe_fetch(fetch_rss)          # fast
-    raw += get_registry_data()            # throttled (1/min)
+    last_modified = os.path.getmtime(DATA_FILE)
+    return now() - last_modified > UPDATE_INTERVAL
 
-    processed = []
+def get_data():
 
-    for e in raw:
-        if not is_valid(e["text"]):
-            continue
+    # ✅ update if needed
+    if needs_update():
+        try:
+            data = fetch_data()
 
-        processed.append({
-            **e,
-            "entity": extract_entity(e["text"]),
-            "event_type": classify(e["text"])
-        })
+            with open(DATA_FILE, "w") as f:
+                json.dump(data, f)
 
-    return group(processed)
+        except:
+            pass  # silently fail
+
+    # ✅ serve existing data
+    try:
+        with open(DATA_FILE) as f:
+            return json.load(f)
+    except:
+        return []
 
 # =========================
 # API
@@ -256,19 +164,5 @@ def root():
     return {"status": "running"}
 
 @app.get("/events")
-def get_events():
-
-    try:
-        if now() - CACHE["timestamp"] < CACHE_TTL:
-            return CACHE["data"]
-
-        data = refresh_data()
-
-        CACHE["data"] = data
-        CACHE["timestamp"] = now()
-
-        return data
-
-    except Exception as e:
-        print("CRITICAL ERROR:", e)
-        return CACHE["data"]
+def events():
+    return get_data()
