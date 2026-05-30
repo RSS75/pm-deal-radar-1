@@ -20,34 +20,62 @@ app.add_middleware(
 # CONFIG
 # =========================
 
+COMPANIES_HOUSE_API_KEY = "YOUR_KEY"
+KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle", "financing"]
+
 RSS_FEEDS = [
     "https://www.privateequityinternational.com/feed/",
     "https://www.inframationnews.com/feed/"
 ]
 
-COMPANIES_HOUSE_API_KEY = "YOUR_REAL_KEY"  # ✅ MUST BE REAL
-
-KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle", "financing"]
+# Global registry proxies (STABLE RSS)
+LUX_RSS = "https://www.cssf.lu/en/rss/"
+IRELAND_RSS = "https://www.centralbank.ie/news/rss"
 
 # =========================
-# SAFE UTILS
+# UTIL
 # =========================
 
-def is_recent(dt):
+def safe_time(dt):
     try:
-        return dt and (datetime.utcnow() - dt <= timedelta(hours=48))
+        return dt.isoformat()
     except:
+        return datetime.utcnow().isoformat()
+
+def parse_iso(ts):
+    try:
+        return datetime.fromisoformat(ts)
+    except:
+        return None
+
+def is_recent(ts):
+    dt = parse_iso(ts)
+    if not dt:
         return False
+    return datetime.utcnow() - dt <= timedelta(hours=48)
 
 def is_valid(text):
-    try:
-        return any(k in text.lower() for k in KEYWORDS)
-    except:
-        return False
+    return text and any(k in text.lower() for k in KEYWORDS)
 
 # =========================
-# ✅ ENTITY EXTRACTION
+# ENTITY EXTRACTION + NORMALISATION
 # =========================
+
+def normalize_entity(name):
+    name = name.strip()
+
+    # collapse long names → core identity
+    replacements = [
+        ("Capital Partners", "Capital"),
+        ("Infrastructure Partners", "Infrastructure"),
+        ("Private Equity", ""),
+        ("Holdings", "")
+    ]
+
+    for k, v in replacements:
+        name = name.replace(k, v)
+
+    return name.strip()
 
 def extract_entity(text):
     try:
@@ -56,21 +84,20 @@ def extract_entity(text):
 
         GP_HINTS = [
             "capital", "partners", "equity", "ventures",
-            "infrastructure", "real estate", "management",
-            "group", "holdings"
+            "infrastructure", "real estate", "group"
         ]
 
         for c in candidates:
             if any(h in c.lower() for h in GP_HINTS):
-                return c
+                return normalize_entity(c)
 
-        return candidates[0] if candidates else "Unknown"
+        return normalize_entity(candidates[0]) if candidates else "Unknown"
 
     except:
         return "Unknown"
 
 # =========================
-# CLASSIFICATION
+# CLASSIFY
 # =========================
 
 def classify(text):
@@ -89,30 +116,29 @@ def classify(text):
             return "FINANCING"
 
         return "OTHER"
+
     except:
         return "OTHER"
 
 # =========================
-# ✅ SOURCE 1: RSS
+# SOURCE: RSS NEWS
 # =========================
 
 def fetch_rss():
-    results = []
+    out = []
 
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
 
             for e in feed.entries:
-                if not e.get("published_parsed"):
-                    continue
-
                 try:
                     dt = datetime(*e.published_parsed[:6])
                 except:
                     continue
 
-                if not is_recent(dt):
+                ts = safe_time(dt)
+                if not is_recent(ts):
                     continue
 
                 text = (e.title or "") + " " + (e.get("summary", "") or "")
@@ -120,235 +146,250 @@ def fetch_rss():
                 if not is_valid(text):
                     continue
 
-                results.append({
-                    "title": e.title or "",
+                out.append({
+                    "title": e.title,
                     "text": text,
-                    "url": e.link or "",
+                    "url": e.link,
                     "summary": e.get("summary", ""),
                     "source": "NEWS",
-                    "timestamp": dt.isoformat()
+                    "timestamp": ts
                 })
 
-        except Exception as e:
-            print("RSS error:", e)
+        except:
+            continue
 
-    return results
+    return out
 
 # =========================
-# ✅ SOURCE 2: UK COMPANIES HOUSE
+# SOURCE: COMPANIES HOUSE
 # =========================
 
-def fetch_companies_house():
-    results = []
+def fetch_uk_registry():
+    out = []
 
     try:
-        url = "https://api.company-information.service.gov.uk/search/companies?q=fund"
-
         r = requests.get(
-            url,
+            "https://api.company-information.service.gov.uk/search/companies?q=fund",
             auth=(COMPANIES_HOUSE_API_KEY, ""),
             timeout=5
         )
 
-        if r.status_code != 200:
-            return results
+        items = r.json().get("items", [])
 
-        data = r.json()
-
-        for item in data.get("items", [])[:15]:
-
-            title = item.get("title", "")
+        for i in items[:10]:
+            title = i.get("title", "")
 
             if not is_valid(title):
                 continue
 
-            results.append({
+            out.append({
                 "title": f"UK Registry: {title}",
                 "text": title,
-                "url": f"https://find-and-update.company-information.service.gov.uk/company/{item.get('company_number')}",
-                "summary": "UK registry fund/SPV signal",
+                "url": "https://find-and-update.company-information.service.gov.uk/company/" + i.get("company_number", ""),
+                "summary": "UK fund/SPV registration",
                 "source": "REGISTRY_UK",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": safe_time(datetime.utcnow())
             })
 
-    except Exception as e:
-        print("Companies House error:", e)
+    except:
+        pass
 
-    return results
+    return out
 
 # =========================
-# ✅ SOURCE 3: SEC (FORM D SIGNALS)
+# SOURCE: LUX + IRELAND
+# =========================
+
+def fetch_registry_rss(url, label):
+    out = []
+
+    try:
+        feed = feedparser.parse(url)
+
+        for e in feed.entries[:10]:
+            try:
+                dt = datetime(*e.published_parsed[:6])
+            except:
+                continue
+
+            ts = safe_time(dt)
+
+            if not is_recent(ts):
+                continue
+
+            text = e.title or ""
+
+            if not is_valid(text):
+                continue
+
+            out.append({
+                "title": e.title,
+                "text": text,
+                "url": e.link,
+                "summary": f"{label} registry signal",
+                "source": label,
+                "timestamp": ts
+            })
+
+    except:
+        pass
+
+    return out
+
+# =========================
+# SOURCE: SEC EDGAR (REAL SAFE SCRAPE)
 # =========================
 
 def fetch_sec():
-    results = []
-
-    try:
-        # minimal safe signal (SEC requires user agent normally)
-        results.append({
-            "title": "SEC Form D filing (potential fund raise)",
-            "text": "fund filing raise sec",
-            "url": "https://www.sec.gov",
-            "summary": "SEC filing indicating possible new fund",
-            "source": "SEC",
-            "timestamp": datetime.utcnow().isoformat()
-        })
-
-    except Exception as e:
-        print("SEC error:", e)
-
-    return results
-
-# =========================
-# ✅ SOURCE 4: PREQIN (SAFE)
-# =========================
-
-def fetch_preqin():
-    results = []
+    out = []
 
     try:
         r = requests.get(
-            "https://www.preqin.com/insights",
-            timeout=5,
-            headers={"User-Agent": "Mozilla/5.0"}
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5
         )
-
-        if r.status_code != 200:
-            return results
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        for a in soup.find_all("a")[:20]:
+        rows = soup.find_all("tr")
+
+        for r in rows[:20]:
+            text = r.get_text(" ", strip=True)
+
+            if "D" not in text:
+                continue
+
+            if not is_valid(text):
+                continue
+
+            out.append({
+                "title": text[:120],
+                "text": text,
+                "url": "https://www.sec.gov",
+                "summary": "SEC Form D filing",
+                "source": "SEC",
+                "timestamp": safe_time(datetime.utcnow())
+            })
+
+    except:
+        pass
+
+    return out
+
+# =========================
+# PREQIN
+# =========================
+
+def fetch_preqin():
+    out = []
+
+    try:
+        r = requests.get("https://www.preqin.com/insights", timeout=5)
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for a in soup.find_all("a")[:15]:
             title = a.get_text(strip=True)
 
             if not title or not is_valid(title):
                 continue
 
-            results.append({
+            out.append({
                 "title": title,
                 "text": title,
                 "url": a.get("href") or "",
-                "summary": "Preqin fund activity",
+                "summary": "Preqin signal",
                 "source": "PREQIN",
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": safe_time(datetime.utcnow())
             })
 
-    except Exception as e:
-        print("Preqin error:", e)
+    except:
+        pass
 
-    return results
+    return out
 
 # =========================
-# ✅ DEDUP
+# PIPELINE
 # =========================
 
-def deduplicate(events):
+def dedupe(events):
     seen = set()
-    output = []
-
+    out = []
     for e in events:
-        key = e.get("title", "")
-        if key and key not in seen:
-            seen.add(key)
-            output.append(e)
+        k = e.get("title", "")
+        if k and k not in seen:
+            seen.add(k)
+            out.append(e)
+    return out
 
-    return output
-
-# =========================
-# ✅ GROUP + TIME CLUSTER
-# =========================
-
-def group_by_entity(events):
-    grouped = {}
+def group(events):
+    g = {}
     now = datetime.utcnow()
 
     for e in events:
-        try:
-            entity = e.get("entity", "Unknown")
-
-            try:
-                ts = datetime.fromisoformat(e.get("timestamp"))
-            except:
-                continue
-
-            if entity not in grouped:
-                grouped[entity] = {
-                    "entity": entity,
-                    "activity_count": 0,
-                    "activity": {
-                        "last_6h": 0,
-                        "last_24h": 0,
-                        "last_48h": 0
-                    },
-                    "events": []
-                }
-
-            grouped[entity]["events"].append(e)
-            grouped[entity]["activity_count"] += 1
-
-            diff = now - ts
-
-            if diff <= timedelta(hours=48):
-                grouped[entity]["activity"]["last_48h"] += 1
-            if diff <= timedelta(hours=24):
-                grouped[entity]["activity"]["last_24h"] += 1
-            if diff <= timedelta(hours=6):
-                grouped[entity]["activity"]["last_6h"] += 1
-
-        except:
+        ts = parse_iso(e["timestamp"])
+        if not ts:
             continue
 
-    for g in grouped.values():
-        g["events"].sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        entity = e["entity"]
+
+        if entity not in g:
+            g[entity] = {
+                "entity": entity,
+                "activity": {"last_6h":0,"last_24h":0,"last_48h":0},
+                "activity_count":0,
+                "events":[]
+            }
+
+        diff = now - ts
+
+        if diff <= timedelta(hours=48):
+            g[entity]["activity"]["last_48h"] += 1
+        if diff <= timedelta(hours=24):
+            g[entity]["activity"]["last_24h"] += 1
+        if diff <= timedelta(hours=6):
+            g[entity]["activity"]["last_6h"] += 1
+
+        g[entity]["activity_count"] += 1
+        g[entity]["events"].append(e)
 
     return sorted(
-        grouped.values(),
-        key=lambda x: (
-            x["activity"]["last_6h"],
-            x["activity"]["last_24h"],
-            x["activity"]["last_48h"]
-        ),
+        g.values(),
+        key=lambda x: (x["activity"]["last_6h"], x["activity"]["last_24h"]),
         reverse=True
     )
 
 # =========================
-# ✅ MAIN API
+# MAIN
 # =========================
-
-@app.get("/")
-def root():
-    return {"status": "running"}
 
 @app.get("/events")
 def get_events():
-
     try:
         raw = []
-
         raw += fetch_rss()
-        raw += fetch_companies_house()
+        raw += fetch_uk_registry()
+        raw += fetch_registry_rss(LUX_RSS, "REGISTRY_LUX")
+        raw += fetch_registry_rss(IRELAND_RSS, "REGISTRY_IE")
         raw += fetch_sec()
         raw += fetch_preqin()
 
-        raw = deduplicate(raw)
+        raw = dedupe(raw)
 
         processed = []
 
         for e in raw:
-            if not is_valid(e.get("text", "")):
+            if not is_valid(e["text"]):
                 continue
 
-            try:
-                processed.append({
-                    **e,
-                    "entity": extract_entity(e.get("text", "")),
-                    "event_type": classify(e.get("text", ""))
-                })
-            except:
-                continue
+            processed.append({
+                **e,
+                "entity": extract_entity(e["text"]),
+                "event_type": classify(e["text"])
+            })
 
-        return group_by_entity(processed)
+        return group(processed)
 
-    except Exception as e:
-        print("MAIN ERROR:", e)
+    except:
         return []
