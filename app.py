@@ -1,9 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
-import requests
 import re
-from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import time
 
@@ -22,7 +20,7 @@ app.add_middleware(
 # =========================
 
 CACHE = {"data": [], "timestamp": 0}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 300  # 5 min
 
 # =========================
 # CONFIG
@@ -33,10 +31,10 @@ RSS_FEEDS = [
     "https://www.inframationnews.com/feed/"
 ]
 
-KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle"]
+KEYWORDS = ["fund", "investment", "acquire", "close", "spv"]
 
 # =========================
-# SAFE HELPERS
+# HELPERS
 # =========================
 
 def now():
@@ -62,7 +60,7 @@ def is_valid(text):
     return text and any(k in text.lower() for k in KEYWORDS)
 
 # =========================
-# ENTITY EXTRACTION
+# ENTITY
 # =========================
 
 def extract_entity(text):
@@ -91,18 +89,7 @@ def classify(text):
     return "OTHER"
 
 # =========================
-# SAFE FETCH WRAPPER
-# =========================
-
-def safe_fetch(fn):
-    try:
-        return fn()
-    except Exception as e:
-        print(f"{fn.__name__} failed:", e)
-        return []
-
-# =========================
-# SOURCE 1: RSS (PRIMARY)
+# RSS ONLY (SAFE)
 # =========================
 
 def fetch_rss():
@@ -112,8 +99,8 @@ def fetch_rss():
         try:
             feed = feedparser.parse(url)
 
-            # 🔥 limit entries to avoid overload
-            for e in feed.entries[:6]:
+            # 🔥 VERY small sample (critical)
+            for e in feed.entries[:5]:
 
                 try:
                     dt = datetime(*e.published_parsed[:6])
@@ -144,47 +131,7 @@ def fetch_rss():
     return out
 
 # =========================
-# SOURCE 2: SEC (VERY LIGHT)
-# =========================
-
-def fetch_sec():
-    out = []
-
-    try:
-        r = requests.get(
-            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent",
-            timeout=2,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # 🔥 VERY LIMITED parsing
-        for row in soup.find_all("tr")[:5]:
-
-            text = row.get_text()
-
-            if "D" not in text:
-                continue
-
-            if not is_valid(text):
-                continue
-
-            out.append({
-                "title": text[:100],
-                "text": text,
-                "url": "https://www.sec.gov",
-                "source": "SEC",
-                "timestamp": safe_iso(datetime.utcnow())
-            })
-
-    except:
-        pass
-
-    return out
-
-# =========================
-# GROUP BY ENTITY
+# GROUP
 # =========================
 
 def group(events):
@@ -196,8 +143,8 @@ def group(events):
         if entity not in grouped:
             grouped[entity] = {
                 "entity": entity,
-                "events": [],
-                "activity_count": 0
+                "activity_count": 0,
+                "events": []
             }
 
         grouped[entity]["events"].append(e)
@@ -206,14 +153,11 @@ def group(events):
     return list(grouped.values())
 
 # =========================
-# MAIN FETCH
+# MAIN
 # =========================
 
 def refresh_data():
-    raw = []
-
-    raw += safe_fetch(fetch_rss)
-    raw += safe_fetch(fetch_sec)  # lightweight
+    raw = fetch_rss()
 
     processed = []
 
@@ -233,19 +177,14 @@ def refresh_data():
 # API
 # =========================
 
-@app.get("/")
-def root():
-    return {"status": "running"}
-
 @app.get("/events")
 def get_events():
-
     try:
-        # ✅ CACHE HIT
+        # ✅ cache hit
         if now() - CACHE["timestamp"] < CACHE_TTL:
             return CACHE["data"]
 
-        # ✅ REFRESH
+        # ✅ refresh (LIGHT)
         data = refresh_data()
 
         CACHE["data"] = data
@@ -253,6 +192,5 @@ def get_events():
 
         return data
 
-    except Exception as e:
-        print("CRITICAL ERROR:", e)
+    except:
         return CACHE["data"]
