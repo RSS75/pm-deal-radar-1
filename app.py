@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
-from datetime import datetime
+import re
 
 app = FastAPI()
 
@@ -13,79 +13,205 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =========================
+# SOURCES
+# =========================
+
 RSS_FEEDS = [
     "https://www.privateequityinternational.com/feed/",
-    "https://www.inframationnews.com/feed/",
-    "https://www.ft.com/rss/home"
+    "https://www.inframationnews.com/feed/"
 ]
 
-KEYWORDS = ["fund", "investment", "acquire", "deal", "raise"]
+# =========================
+# SOURCE LAYER
+# =========================
 
-def is_relevant(text):
-    return any(k in text.lower() for k in KEYWORDS)
+def fetch_rss():
+    data = []
+
+    for url in RSS_FEEDS:
+        feed = feedparser.parse(url)
+
+        for e in feed.entries[:20]:
+            data.append({
+                "title": e.title,
+                "text": f"{e.title} {e.get('summary','')}",
+                "url": e.link,
+                "source": "NEWS"
+            })
+
+    return data
+
+
+def fetch_registries():
+    # ✅ placeholder for Companies House / SEC later
+    return [
+        {
+            "title": "SPV created for infrastructure investment",
+            "text": "New SPV infrastructure fund Europe created",
+            "url": "#",
+            "source": "REGISTRY"
+        }
+    ]
+
+
+def fetch_social():
+    # ✅ lightweight signal layer (not scraping LinkedIn)
+    return [
+        {
+            "title": "KKR launches new infrastructure fund",
+            "text": "KKR infrastructure fund Europe launch",
+            "url": "#",
+            "source": "SOCIAL"
+        }
+    ]
+
+
+# =========================
+# NORMALIZATION
+# =========================
+
+def normalize(r):
+    return {
+        "title": r["title"],
+        "text": r["text"],
+        "url": r["url"],
+        "source": r["source"]
+    }
+
+
+# =========================
+# INTELLIGENCE ENGINE
+# =========================
+
+def is_real_deal(text):
+    DEAL_TERMS = ["acquire", "investment", "fund", "close", "financing", "stake"]
+    NOISE = ["opinion", "analysis", "how", "why"]
+
+    t = text.lower()
+    return any(k in t for k in DEAL_TERMS) and not any(n in t for n in NOISE)
+
+
+def is_illiquid_gp(text):
+    GP_TERMS = ["capital", "partners", "equity", "infrastructure", "real estate", "ventures"]
+    EXCLUDE = ["bank", "etf", "insurance"]
+
+    t = text.lower()
+    return any(k in t for k in GP_TERMS) and not any(e in t for e in EXCLUDE)
+
+
+def classify(text):
+    t = text.lower()
+
+    if "fund" in t and ("close" in t or "launch" in t):
+        return "FUND"
+
+    if "acquire" in t or "investment" in t:
+        return "INVESTMENT"
+
+    if "debt" in t or "financing" in t:
+        return "FINANCING"
+
+    return "OTHER"
+
 
 def detect_region(text):
     t = text.lower()
-    if "europe" in t: return "Europe"
-    if "asia" in t: return "Asia"
-    if "uk" in t: return "UK"
-    if "us" in t: return "US"
-    return "Global"
 
-def detect_asset(text):
-    t = text.lower()
-    if "infrastructure" in t: return "Infrastructure"
-    if "real estate" in t: return "Real Estate"
-    if "debt" in t: return "Private Debt"
-    if "venture" in t or "vc" in t: return "VC"
-    return "Private Equity"
+    if re.search(r"india|china|japan|asia", t):
+        return "ASIA"
+    if re.search(r"germany|france|spain|europe", t):
+        return "EUROPE"
+    if re.search(r"uk|britain", t):
+        return "UK"
+    if re.search(r"us|america", t):
+        return "US"
 
-def detect_fx(text):
-    return any(k in text.lower() for k in ["europe", "asia", "cross-border", "usd", "eur"])
+    return "GLOBAL"
 
-def detect_ir(text):
-    return any(k in text.lower() for k in ["debt", "financing", "yield", "leverage"])
 
-def score_event(text, fx, ir):
+# =========================
+# EXPOSURE ENGINE (KEY LOGIC)
+# =========================
+
+def infer_exposure(text, region, event_type):
+
+    # ✅ cross-border proxy (correct approach, not currencies)
+    cross_border = region != "US"
+
+    # ✅ leverage detection → IR exposure
+    leverage = "debt" in text.lower() or event_type == "FINANCING"
+
+    return {
+        "fx": cross_border,
+        "ir": leverage
+    }
+
+
+# =========================
+# PRIORITY MODEL
+# =========================
+
+def score(event):
     score = 0
-    if fx: score += 2
-    if ir: score += 2
-    if "acquire" in text.lower() or "deal" in text.lower():
-        score += 1
+
+    if event["fx"]:
+        score += 3
+
+    if event["ir"]:
+        score += 2
+
+    if event["event_type"] in ["FUND", "INVESTMENT"]:
+        score += 2
+
     return score
+
+
+# =========================
+# MAIN PIPELINE
+# =========================
 
 @app.get("/")
 def root():
     return {"status": "running"}
 
+
 @app.get("/events")
 def get_events():
 
-    events = []
+    raw = []
+    raw += fetch_rss()
+    raw += fetch_registries()
+    raw += fetch_social()
 
-    for url in RSS_FEEDS:
-        feed = feedparser.parse(url)
+    processed = []
 
-        for entry in feed.entries[:15]:
-            text = f"{entry.title} {entry.get('summary','')}"
+    for r in raw:
+        n = normalize(r)
+        text = n["text"]
 
-            if not is_relevant(text):
-                continue
+        # ✅ STRICT FILTERING
+        if not is_real_deal(text):
+            continue
 
-            fx = detect_fx(text)
-            ir = detect_ir(text)
+        if not is_illiquid_gp(text):
+            continue
 
-            event = {
-                "title": entry.title,
-                "article_url": entry.link,
-                "region": detect_region(text),
-                "asset_class": detect_asset(text),
-                "fx": fx,
-                "ir": ir,
-                "priority": score_event(text, fx, ir),
-                "timestamp": entry.get("published", "")
-            }
+        event_type = classify(text)
+        region = detect_region(text)
 
-            events.append(event)
+        exposure = infer_exposure(text, region, event_type)
 
-    return events
+        event = {
+            **n,
+            "region": region,
+            "event_type": event_type,
+            "fx": exposure["fx"],
+            "ir": exposure["ir"]
+        }
+
+        event["priority"] = score(event)
+
+        processed.append(event)
+
+    return sorted(processed, key=lambda x: x["priority"], reverse=True)
