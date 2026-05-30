@@ -18,11 +18,11 @@ app.add_middleware(
 )
 
 # =========================
-# CACHE (ABSOLUTE KEY FIX)
+# CACHE
 # =========================
 
 CACHE = {"data": [], "timestamp": 0}
-CACHE_TTL = 300  # 5 mins
+CACHE_TTL = 300  # 5 minutes
 
 # =========================
 # CONFIG
@@ -62,7 +62,7 @@ def is_valid(text):
     return text and any(k in text.lower() for k in KEYWORDS)
 
 # =========================
-# ENTITY
+# ENTITY EXTRACTION
 # =========================
 
 def extract_entity(text):
@@ -102,7 +102,7 @@ def safe_fetch(fn):
         return []
 
 # =========================
-# SOURCES (LIGHTWEIGHT)
+# SOURCE 1: RSS (PRIMARY)
 # =========================
 
 def fetch_rss():
@@ -112,7 +112,8 @@ def fetch_rss():
         try:
             feed = feedparser.parse(url)
 
-            for e in feed.entries[:8]:  # VERY IMPORTANT (reduced load)
+            # 🔥 limit entries to avoid overload
+            for e in feed.entries[:6]:
 
                 try:
                     dt = datetime(*e.published_parsed[:6])
@@ -142,39 +143,9 @@ def fetch_rss():
 
     return out
 
-
-def fetch_preqin():
-    out = []
-
-    try:
-        r = requests.get(
-            "https://www.preqin.com/insights",
-            timeout=2,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for a in soup.find_all("a")[:6]:  # 🔥 reduced
-
-            title = a.get_text(strip=True)
-
-            if not title or not is_valid(title):
-                continue
-
-            out.append({
-                "title": title,
-                "text": title,
-                "url": a.get("href") or "",
-                "source": "PREQIN",
-                "timestamp": safe_iso(datetime.utcnow())
-            })
-
-    except:
-        pass
-
-    return out
-
+# =========================
+# SOURCE 2: SEC (VERY LIGHT)
+# =========================
 
 def fetch_sec():
     out = []
@@ -188,11 +159,15 @@ def fetch_sec():
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        for row in soup.find_all("tr")[:6]:  # 🔥 reduced
+        # 🔥 VERY LIMITED parsing
+        for row in soup.find_all("tr")[:5]:
 
             text = row.get_text()
 
-            if "D" not in text or not is_valid(text):
+            if "D" not in text:
+                continue
+
+            if not is_valid(text):
                 continue
 
             out.append({
@@ -209,7 +184,7 @@ def fetch_sec():
     return out
 
 # =========================
-# GROUP
+# GROUP BY ENTITY
 # =========================
 
 def group(events):
@@ -221,23 +196,24 @@ def group(events):
         if entity not in grouped:
             grouped[entity] = {
                 "entity": entity,
-                "events": []
+                "events": [],
+                "activity_count": 0
             }
 
         grouped[entity]["events"].append(e)
+        grouped[entity]["activity_count"] += 1
 
     return list(grouped.values())
 
 # =========================
-# MAIN FETCH (ONLY WHEN NEEDED)
+# MAIN FETCH
 # =========================
 
 def refresh_data():
-
     raw = []
+
     raw += safe_fetch(fetch_rss)
-    raw += safe_fetch(fetch_preqin)
-    raw += safe_fetch(fetch_sec)
+    raw += safe_fetch(fetch_sec)  # lightweight
 
     processed = []
 
@@ -265,11 +241,11 @@ def root():
 def get_events():
 
     try:
-        # ✅ CACHE CHECK
+        # ✅ CACHE HIT
         if now() - CACHE["timestamp"] < CACHE_TTL:
             return CACHE["data"]
 
-        # ✅ FETCH NEW DATA
+        # ✅ REFRESH
         data = refresh_data()
 
         CACHE["data"] = data
@@ -279,4 +255,4 @@ def get_events():
 
     except Exception as e:
         print("CRITICAL ERROR:", e)
-        return CACHE["data"]  # fallback
+        return CACHE["data"]
