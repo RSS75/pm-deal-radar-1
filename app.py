@@ -1,7 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
+import requests
 import re
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 
 app = FastAPI()
@@ -15,7 +17,7 @@ app.add_middleware(
 )
 
 # =========================
-# SOURCES (REAL ONLY)
+# CONFIG
 # =========================
 
 RSS_FEEDS = [
@@ -23,140 +25,246 @@ RSS_FEEDS = [
     "https://www.inframationnews.com/feed/"
 ]
 
-# =========================
-# TIME FILTER (48 HOURS)
-# =========================
+COMPANIES_HOUSE_API_KEY = "ADD_YOUR_KEY_HERE"
 
-def is_recent(entry):
-    try:
-        published = entry.get("published_parsed")
-
-        if not published:
-            return True  # fallback
-
-        published_dt = datetime(*published[:6])
-        now = datetime.utcnow()
-
-        return (now - published_dt) <= timedelta(hours=48)
-
-    except:
-        return True  # safe fallback
-
+KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle", "financing"]
 
 # =========================
-# SOURCE LAYER
+# TIME FILTER (48H)
 # =========================
 
-def fetch_rss():
-    data = []
-
-    for url in RSS_FEEDS:
-        feed = feedparser.parse(url)
-
-        for e in feed.entries:
-
-            # ✅ 48H FILTER HERE (BACKEND LEVEL ✅)
-            if not is_recent(e):
-                continue
-
-            data.append({
-                "title": e.title,
-                "text": f"{e.title} {e.get('summary','')}",
-                "url": e.link,
-                "source": "NEWS",
-                "summary": e.get("summary", ""),
-                "timestamp": datetime(*e.published_parsed[:6]).isoformat()
-                if "published_parsed" in e else None
-            })
-
-    return data
-
+def is_recent(dt):
+    return dt and (datetime.utcnow() - dt <= timedelta(hours=48))
 
 # =========================
-# INTELLIGENCE ENGINE
+# ✅ DYNAMIC ENTITY EXTRACTION (FIXED)
 # =========================
 
-def is_real_deal(text):
-    DEAL_TERMS = ["acquire", "investment", "fund", "close", "financing", "stake", "launch", "spv"]
-    NOISE = ["opinion", "analysis", "how", "why"]
+def extract_entity(text):
+    """
+    Dynamically extract GP / firm names (no hardcoding)
+    """
 
-    t = text.lower()
-    return any(k in t for k in DEAL_TERMS) and not any(n in t for n in NOISE)
+    # Step 1: extract candidate capitalised phrases
+    matches = re.findall(r"\b(?:[A-Z][a-z]+(?:\s|$)){1,4}", text)
 
+    candidates = [m.strip() for m in matches if len(m.strip()) > 2]
 
-def is_illiquid_gp(text):
-    GP_TERMS = ["capital", "partners", "equity", "infrastructure", "real estate", "ventures"]
-    EXCLUDE = ["bank", "etf", "insurance"]
+    # Step 2: filter for GP-like names
+    GP_HINTS = [
+        "capital", "partners", "equity", "ventures",
+        "infrastructure", "real estate", "management", "group", "holdings"
+    ]
 
-    t = text.lower()
-    return any(k in t for k in GP_TERMS) and not any(e in t for e in EXCLUDE)
+    for c in candidates:
+        if any(h in c.lower() for h in GP_HINTS):
+            return c
 
+    # Step 3: fallback
+    return candidates[0] if candidates else "Unknown"
+
+# =========================
+# CLASSIFICATION
+# =========================
 
 def classify(text):
     t = text.lower()
 
-    if "fund" in t and ("close" in t or "launch" in t or "raising" in t):
-        return "FUND"
+    if "fund" in t and ("launch" in t or "raise" in t):
+        return "FUND_LAUNCH"
 
-    if "acquire" in t or "investment" in t or "stake" in t:
+    if "close" in t:
+        return "FUND_CLOSE"
+
+    if "spv" in t or "vehicle" in t:
+        return "STRUCTURE"
+
+    if "acquire" in t or "investment" in t:
         return "INVESTMENT"
 
     if "debt" in t or "financing" in t:
         return "FINANCING"
 
-    if "spv" in t or "vehicle" in t:
-        return "STRUCTURE"
-
     return "OTHER"
 
-
-def detect_region(text):
-    t = text.lower()
-
-    if re.search(r"india|china|japan|asia", t):
-        return "ASIA"
-    if re.search(r"germany|france|spain|europe", t):
-        return "EUROPE"
-    if re.search(r"uk|britain", t):
-        return "UK"
-    if re.search(r"us|america", t):
-        return "US"
-
-    return "GLOBAL"
-
+def is_valid(text):
+    return any(k in text.lower() for k in KEYWORDS)
 
 # =========================
-# EXPOSURE ENGINE
+# SOURCE 1: RSS
 # =========================
 
-def infer_exposure(text, region, event_type):
-    cross_border = region != "US"
-    leverage = "debt" in text.lower() or event_type == "FINANCING"
+def fetch_rss():
+    results = []
 
-    return {
-        "fx": cross_border,
-        "ir": leverage
-    }
+    for url in RSS_FEEDS:
+        feed = feedparser.parse(url)
 
+        for e in feed.entries:
+            if not e.get("published_parsed"):
+                continue
+
+            dt = datetime(*e.published_parsed[:6])
+
+            if not is_recent(dt):
+                continue
+
+            text = e.title + " " + e.get("summary", "")
+
+            if not is_valid(text):
+                continue
+
+            results.append({
+                "title": e.title,
+                "text": text,
+                "url": e.link,
+                "summary": e.get("summary", ""),
+                "source": "NEWS",
+                "timestamp": dt.isoformat()
+            })
+
+    return results
 
 # =========================
-# PRIORITY
+# SOURCE 2: REGISTRY (UK)
 # =========================
 
-def score(event):
-    score = 0
+def fetch_registry():
+    results = []
 
-    if event["fx"]:
-        score += 3
+    try:
+        url = "https://api.company-information.service.gov.uk/search/companies?q=fund"
 
-    if event["ir"]:
-        score += 2
+        r = requests.get(
+            url,
+            auth=(COMPANIES_HOUSE_API_KEY, ""),
+            timeout=5
+        )
 
-    if event["event_type"] in ["FUND", "INVESTMENT"]:
-        score += 2
+        data = r.json()
 
-    return score
+        for item in data.get("items", [])[:15]:
+            title = item.get("title", "")
 
+            if not is_valid(title):
+                continue
+
+            results.append({
+                "title": f"New entity registered: {title}",
+                "text": title,
+                "url": f"https://find-and-update.company-information.service.gov.uk/company/{item.get('company_number')}",
+                "summary": "Registry signal: potential fund/SPV",
+                "source": "REGISTRY",
+                "timestamp": datetime.utcnow().isoformat()
+            })
+
+    except Exception as e:
+        print("Registry error:", e)
+
+    return results
+
+# =========================
+# SOURCE 3: PREQIN
+# =========================
+
+def fetch_preqin():
+    results = []
+
+    try:
+        url = "https://www.preqin.com/insights"
+        r = requests.get(url, timeout=5)
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        links = soup.find_all("a")
+
+        for a in links[:30]:
+            title = a.get_text(strip=True)
+
+            if not title or not is_valid(title):
+                continue
+
+            results.append({
+                "title": title,
+                "text": title,
+                "url": a.get("href"),
+                "summary": "Preqin signal",
+                "source": "PREQIN",
+                "timestamp": datetime.utcnow().isoformat()
+            })
+
+    except Exception as e:
+        print("Preqin error:", e)
+
+    return results
+
+# =========================
+# DEDUPLICATION
+# =========================
+
+def deduplicate(events):
+    seen = set()
+    clean = []
+
+    for e in events:
+        key = e["title"]
+
+        if key not in seen:
+            seen.add(key)
+            clean.append(e)
+
+    return clean
+
+# =========================
+# ✅ GROUP BY ENTITY + TIME CLUSTERING
+# =========================
+
+def group_by_entity(events):
+    grouped = {}
+    now = datetime.utcnow()
+
+    for e in events:
+        entity = e["entity"]
+        ts = datetime.fromisoformat(e["timestamp"])
+
+        if entity not in grouped:
+            grouped[entity] = {
+                "entity": entity,
+                "activity_count": 0,
+                "activity": {
+                    "last_6h": 0,
+                    "last_24h": 0,
+                    "last_48h": 0
+                },
+                "events": []
+            }
+
+        grouped[entity]["events"].append(e)
+        grouped[entity]["activity_count"] += 1
+
+        diff = now - ts
+
+        if diff <= timedelta(hours=48):
+            grouped[entity]["activity"]["last_48h"] += 1
+        if diff <= timedelta(hours=24):
+            grouped[entity]["activity"]["last_24h"] += 1
+        if diff <= timedelta(hours=6):
+            grouped[entity]["activity"]["last_6h"] += 1
+
+    # sort events per entity by most recent
+    for g in grouped.values():
+        g["events"].sort(key=lambda x: x["timestamp"], reverse=True)
+
+    # sort entities by activity intensity
+    return sorted(
+        grouped.values(),
+        key=lambda x: (
+            x["activity"]["last_6h"],
+            x["activity"]["last_24h"],
+            x["activity"]["last_48h"]
+        ),
+        reverse=True
+    )
 
 # =========================
 # MAIN API
@@ -166,41 +274,29 @@ def score(event):
 def root():
     return {"status": "running"}
 
-
 @app.get("/events")
 def get_events():
 
-    raw = fetch_rss()  # ✅ ONLY REAL DATA NOW
+    raw = []
+    raw += fetch_rss()
+    raw += fetch_registry()
+    raw += fetch_preqin()
+
+    raw = deduplicate(raw)
 
     processed = []
 
-    for r in raw:
-        text = r["text"]
-
-        if not is_real_deal(text):
+    for e in raw:
+        if not is_valid(e["text"]):
             continue
 
-        if not is_illiquid_gp(text):
-            continue
+        entity = extract_entity(e["text"])
+        event_type = classify(e["text"])
 
-        event_type = classify(text)
-        region = detect_region(text)
-        exposure = infer_exposure(text, region, event_type)
+        processed.append({
+            **e,
+            "entity": entity,
+            "event_type": event_type
+        })
 
-        event = {
-            **r,
-            "region": region,
-            "event_type": event_type,
-            "fx": exposure["fx"],
-            "ir": exposure["ir"],
-            "priority": score({
-                "fx": exposure["fx"],
-                "ir": exposure["ir"],
-                "event_type": event_type
-            })
-        }
-
-        processed.append(event)
-
-    return sorted(processed, key=lambda x: x["priority"], reverse=True)
-``
+    return group_by_entity(processed)
