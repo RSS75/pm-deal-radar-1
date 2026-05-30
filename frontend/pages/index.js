@@ -1,142 +1,253 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 
-export default function GPRadar() {
-  const [data, setData] = useState([]);
-  const [expanded, setExpanded] = useState({});
+const API = process.env.NEXT_PUBLIC_API || "https://your-api  const intervalRef = useRef(null);const API = process.env.NEXT_PUBLIC_API || "https://your-api-url/events";
+  const isMounted = useRef(true);
 
-  useEffect(() => {
-    fetch("https://pm-deal-radar-1-production.up.railway.app/events")
-      .then(res => res.json())
-      .then(setData)
-      .catch(console.error);
-  }, []);
+  // ============================================================
+  // FETCH FUNCTION (CONTROLLED)
+  // ============================================================
 
-  const toggle = (i) => {
-    setExpanded(prev => ({ ...prev, [i]: !prev[i] }));
+  const fetchData = async () => {
+    try {
+      const res = await fetch(API);
+
+      if (!res.ok) return;
+
+      const json = await res.json();
+
+      if (!isMounted.current) return;
+
+      // ✅ Hard limit to protect browser memory
+      const trimmed = json.slice(0, 20);
+
+      setData(trimmed);
+      setLoading(false);
+      setLastUpdated(new Date().toLocaleTimeString());
+
+    } catch (err) {
+      console.error("Fetch failed:", err);
+    }
   };
 
+  // ============================================================
+  // EFFECT (CONTROLLED POLLING)
+  // ============================================================
+
+  useEffect(() => {
+    isMounted.current = true;
+
+    fetchData();
+
+    // ✅ Poll every 30 seconds (matches backend)
+    intervalRef.current = setInterval(fetchData, 30000);
+
+    return () => {
+      isMounted.current = false;
+      clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  // ============================================================
+  // SORT BY ACTIVITY
+  // ============================================================
+
+  const sorted = [...data].sort(
+    (a, b) => b.activity_count - a.activity_count
+  );
+
+  // ============================================================
+  // UI
+  // ============================================================
+
+  if (loading) {
+    return (
+      <div style={styles.container}>
+        <h2>Loading GP Activity…</h2>
+      </div>
+    );
+  }
+
   return (
-    <div style={page}>
-      <h1 style={title}>🌍 GP Activity Intelligence</h1>
+    <div style={styles.container}>
 
-      {data.map((gp, i) => {
-        const isActive = (gp.activity_count || 0) > 1;
+      <div style={styles.header}>
+        <h1>GP Activity Monitor</h1>
+        <div style={styles.meta}>
+          Last updated: {lastUpdated}
+        </div>
+      </div>
 
-        return (
-          <div key={i} style={{ ...gpCard, border: isActive ? "2px solid #2563eb" : "1px solid #e5e7eb" }}>
-
-            {/* HEADER */}
-            <div style={gpHeader} onClick={() => toggle(i)}>
-              <div>
-                <div style={gpName}>{gp.entity}</div>
-                <div style={sub}>{gp.activity_count} events</div>
-              </div>
-              {isActive && <div style={badge}>Active</div>}
-            </div>
-
-            {/* EVENTS (COLLAPSIBLE) */}
-            {expanded[i] && (
-              <div style={eventsGrid}>
-                {gp.events.map((e, idx) => (
-                  <div key={idx} style={card}>
-                    <div style={meta}>{formatType(e.event_type)} | {e.source}</div>
-                    <div style={eventTitle}>{e.title}</div>
-                    <a href={e.url} target="_blank" rel="noreferrer" style={link}>Open →</a>
-                  </div>
-                ))}
-              </div>
-            )}
-
-          </div>
-        );
-      })}
+      <div style={styles.list}>
+        {sorted.map((gp, i) => (
+          <GPCard key={i} gp={gp} />
+        ))}
+      </div>
     </div>
   );
 }
 
+//////////////////////////////////////////////////////////////
+// GP CARD COMPONENT (MEMORY SAFE)
+//////////////////////////////////////////////////////////////
+
+function GPCard({ gp }) {
+  const [open, setOpen] = useState(false);
+
+  const toggle = () => setOpen(!open);
+
+  return (
+    <div style={styles.card}>
+
+      {/* HEADER */}
+      <div style={styles.cardHeader} onClick={toggle}>
+        <div>
+          <div style={styles.entity}>{gp.entity}</div>
+          <div style={styles.count}>
+            {gp.activity_count} signals
+          </div>
+        </div>
+
+        <div style={styles.badge(gp.activity_count)}>
+          {activityLabel(gp.activity_count)}
+        </div>
+      </div>
+
+      {/* EVENTS */}
+      {open && (
+        <div style={styles.events}>
+          {gp.events.map((e, j) => (
+            <EventItem key={j} event={e} />
+          ))}
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+//////////////////////////////////////////////////////////////
+// EVENT COMPONENT (LIGHTWEIGHT)
+//////////////////////////////////////////////////////////////
+
+function EventItem({ event }) {
+  return (
+    <div style={styles.event}>
+      <div style={styles.eventMeta}>
+        {event.source} | {formatType(event.event_type)}
+      </div>
+
+      <div style={styles.eventTitle}>
+        <a href={event.url} target="_blank" rel="noreferrer">
+          {event.title}
+        </a>
+      </div>
+    </div>
+  );
+}
+
+//////////////////////////////////////////////////////////////
+// HELPERS
+//////////////////////////////////////////////////////////////
+
 function formatType(type) {
-  if (type === "FUND_LAUNCH") return "Fund Launch";
-  if (type === "FUND_CLOSE") return "Fund Close";
-  if (type === "STRUCTURE") return "SPV / Structure";
+  if (type === "FUND") return "Fund";
   if (type === "INVESTMENT") return "Investment";
+  if (type === "STRUCTURE") return "Structure";
   return "Other";
 }
 
-// STYLES
+function activityLabel(count) {
+  if (count >= 5) return "High";
+  if (count >= 3) return "Active";
+  return "Low";
+}
 
-const page = {
-  padding: 24,
-  background: "#f3f4f6",
-  fontFamily: "Arial",
-  minHeight: "100vh"
+//////////////////////////////////////////////////////////////
+// STYLES (LIGHTWEIGHT — NO LIBS)
+//////////////////////////////////////////////////////////////
+
+const styles = {
+  container: {
+    padding: 20,
+    background: "#f5f7fa",
+    minHeight: "100vh",
+    fontFamily: "Arial"
+  },
+
+  header: {
+    marginBottom: 20
+  },
+
+  meta: {
+    fontSize: 12,
+    color: "#666"
+  },
+
+  list: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "12px"
+  },
+
+  card: {
+    background: "#fff",
+    padding: 12,
+    borderRadius: 8,
+    boxShadow: "0 2px 4px rgba(0,0,0,0.07)"
+  },
+
+  cardHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    cursor: "pointer"
+  },
+
+  entity: {
+    fontWeight: "bold",
+    fontSize: 16
+  },
+
+  count: {
+    fontSize: 12,
+    color: "#888"
+  },
+
+  badge: (count) => ({
+    padding: "4px 8px",
+    borderRadius: 6,
+    fontSize: 12,
+    background:
+      count >= 5 ? "#fecaca" :
+      count >= 3 ? "#fde68a" :
+      "#e5e7eb"
+  }),
+
+  events: {
+    marginTop: 10,
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px"
+  },
+
+  event: {
+    padding: 8,
+    border: "1px solid #eee",
+    borderRadius: 6
+  },
+
+  eventMeta: {
+    fontSize: 10,
+    color: "#777"
+  },
+
+  eventTitle: {
+    fontSize: 13,
+    fontWeight: "bold"
+  }
 };
 
-const title = {
-  fontSize: 26,
-  fontWeight: "bold",
-  marginBottom: 20
-};
+export default function Home() {
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState(null);
 
-const gpCard = {
-  background: "white",
-  borderRadius: 8,
-  padding: 14,
-  marginBottom: 14,
-  cursor: "pointer",
-  boxShadow: "0 2px 6px rgba(0,0,0,0.06)"
-};
-
-const gpHeader = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "center"
-};
-
-const gpName = {
-  fontSize: 18,
-  fontWeight: "bold"
-};
-
-const sub = {
-  fontSize: 12,
-  color: "#666"
-};
-
-const badge = {
-  background: "#dbeafe",
-  padding: "4px 8px",
-  borderRadius: 6,
-  fontSize: 12
-};
-
-const eventsGrid = {
-  marginTop: 10,
-  display: "grid",
-  gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
-  gap: 10
-};
-
-const card = {
-  background: "#fafafa",
-  border: "1px solid #e5e7eb",
-  padding: 10,
-  borderRadius: 6
-};
-
-const meta = {
-  fontSize: 11,
-  color: "#6b7280"
-};
-
-const eventTitle = {
-  marginTop: 4,
-  fontWeight: "bold",
-  fontSize: 14
-};
-
-const link = {
-  marginTop: 6,
-  display: "inline-block",
-  fontSize: 12,
-  color: "#2563eb"
-};
