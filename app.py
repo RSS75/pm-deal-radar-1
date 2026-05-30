@@ -5,6 +5,7 @@ import requests
 import re
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+import threading
 import time
 
 app = FastAPI()
@@ -18,6 +19,13 @@ app.add_middleware(
 )
 
 # =========================
+# GLOBAL DATA STORE
+# =========================
+
+DATA_CACHE = []
+LAST_UPDATED = None
+
+# =========================
 # CONFIG
 # =========================
 
@@ -29,14 +37,11 @@ RSS_FEEDS = [
 KEYWORDS = ["fund", "investment", "acquire", "close", "spv", "vehicle"]
 
 # =========================
-# SAFE HELPERS
+# UTIL
 # =========================
 
-def safe_iso(dt):
-    try:
-        return dt.isoformat()
-    except:
-        return datetime.utcnow().isoformat()
+def now_iso():
+    return datetime.utcnow().isoformat()
 
 def parse_iso(ts):
     try:
@@ -44,9 +49,8 @@ def parse_iso(ts):
     except:
         return None
 
-def is_recent(ts):
-    dt = parse_iso(ts)
-    return dt and (datetime.utcnow() - dt <= timedelta(hours=48))
+def is_recent(dt):
+    return dt and datetime.utcnow() - dt <= timedelta(hours=48)
 
 def is_valid(text):
     return text and any(k in text.lower() for k in KEYWORDS)
@@ -79,77 +83,70 @@ def classify(text):
     return "OTHER"
 
 # =========================
-# SAFE FETCH WRAPPER (CRITICAL)
-# =========================
-
-def safe_fetch(fn):
-    try:
-        return fn()
-    except Exception as e:
-        print(f"{fn.__name__} failed:", e)
-        return []
-
-# =========================
-# SOURCES
+# SAFE FETCH FUNCTIONS
 # =========================
 
 def fetch_rss():
     out = []
-
     for url in RSS_FEEDS:
-        feed = feedparser.parse(url)
+        try:
+            feed = feedparser.parse(url)
 
-        for e in feed.entries[:10]:  # LIMIT LOAD
-            try:
-                dt = datetime(*e.published_parsed[:6])
-            except:
-                continue
+            for e in feed.entries[:10]:
+                try:
+                    dt = datetime(*e.published_parsed[:6])
+                except:
+                    continue
 
-            ts = safe_iso(dt)
+                if not is_recent(dt):
+                    continue
 
-            if not is_recent(ts):
-                continue
+                text = (e.title or "") + " " + (e.get("summary", "") or "")
 
-            text = (e.title or "") + " " + (e.get("summary", "") or "")
+                if not is_valid(text):
+                    continue
 
-            if not is_valid(text):
-                continue
+                out.append({
+                    "title": e.title,
+                    "text": text,
+                    "url": e.link,
+                    "source": "NEWS",
+                    "timestamp": dt.isoformat()
+                })
 
-            out.append({
-                "title": e.title,
-                "text": text,
-                "url": e.link,
-                "source": "NEWS",
-                "timestamp": ts
-            })
+        except:
+            continue
 
     return out
 
 
 def fetch_preqin():
     out = []
+    try:
+        r = requests.get(
+            "https://www.preqin.com/insights",
+            timeout=3,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
 
-    r = requests.get(
-        "https://www.preqin.com/insights",
-        timeout=3,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    soup = BeautifulSoup(r.text, "html.parser")
+        for a in soup.find_all("a")[:10]:
+            title = a.get_text(strip=True)
 
-    for a in soup.find_all("a")[:10]:
-        title = a.get_text(strip=True)
+            if not title or not is_valid(title):
+                continue
 
-        if not title or not is_valid(title):
-            continue
+            out.append({
+                "title": title,
+                "text": title,
+                "url": a.get("href") or "",
+                "source": "PREQIN",
+                "timestamp": now_iso()
+            })
 
-        out.append({
-            "title": title,
-            "text": title,
-            "url": a.get("href") or "",
-            "source": "PREQIN",
-            "timestamp": safe_iso(datetime.utcnow())
-        })
+    except:
+        pass
 
     return out
 
@@ -157,93 +154,88 @@ def fetch_preqin():
 def fetch_sec():
     out = []
 
-    r = requests.get(
-        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent",
-        timeout=3,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
+    try:
+        r = requests.get(
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent",
+            timeout=3,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
 
-    soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    for row in soup.find_all("tr")[:10]:
-        text = row.get_text()
+        for row in soup.find_all("tr")[:10]:
+            text = row.get_text()
 
-        if "D" not in text or not is_valid(text):
-            continue
+            if "D" not in text or not is_valid(text):
+                continue
 
-        out.append({
-            "title": text[:100],
-            "text": text,
-            "url": "https://www.sec.gov",
-            "source": "SEC",
-            "timestamp": safe_iso(datetime.utcnow())
-        })
+            out.append({
+                "title": text[:100],
+                "text": text,
+                "url": "https://www.sec.gov",
+                "source": "SEC",
+                "timestamp": now_iso()
+            })
+
+    except:
+        pass
 
     return out
 
+# =========================
+# PIPELINE (RUN IN BACKGROUND)
+# =========================
+
+def update_data():
+
+    global DATA_CACHE, LAST_UPDATED
+
+    while True:
+        try:
+            print("Refreshing data...")
+
+            raw = []
+            raw += fetch_rss()
+            raw += fetch_preqin()
+            raw += fetch_sec()
+
+            processed = []
+
+            for e in raw:
+                entity = extract_entity(e["text"])
+                event_type = classify(e["text"])
+
+                processed.append({
+                    **e,
+                    "entity": entity,
+                    "event_type": event_type
+                })
+
+            DATA_CACHE = processed
+            LAST_UPDATED = now_iso()
+
+            print("Update complete:", len(processed), "events")
+
+        except Exception as e:
+            print("Update error:", e)
+
+        time.sleep(300)  # every 5 minutes
 
 # =========================
-# GROUPING
+# START BACKGROUND THREAD
 # =========================
 
-def group(events):
-    grouped = {}
-    now = datetime.utcnow()
-
-    for e in events:
-        ts = parse_iso(e["timestamp"])
-        if not ts:
-            continue
-
-        entity = e["entity"]
-
-        if entity not in grouped:
-            grouped[entity] = {
-                "entity": entity,
-                "activity": {"last_6h":0,"last_24h":0,"last_48h":0},
-                "events":[]
-            }
-
-        diff = now - ts
-
-        if diff <= timedelta(hours=48):
-            grouped[entity]["activity"]["last_48h"] += 1
-        if diff <= timedelta(hours=24):
-            grouped[entity]["activity"]["last_24h"] += 1
-        if diff <= timedelta(hours=6):
-            grouped[entity]["activity"]["last_6h"] += 1
-
-        grouped[entity]["events"].append(e)
-
-    return list(grouped.values())
+threading.Thread(target=update_data, daemon=True).start()
 
 # =========================
-# MAIN
+# API
 # =========================
+
+@app.get("/")
+def root():
+    return {"status": "running", "last_updated": LAST_UPDATED}
 
 @app.get("/events")
 def get_events():
-
-    try:
-        raw = []
-        raw += safe_fetch(fetch_rss)
-        raw += safe_fetch(fetch_preqin)
-        raw += safe_fetch(fetch_sec)
-
-        processed = []
-
-        for e in raw:
-            if not is_valid(e["text"]):
-                continue
-
-            processed.append({
-                **e,
-                "entity": extract_entity(e["text"]),
-                "event_type": classify(e["text"])
-            })
-
-        return group(processed)
-
-    except Exception as e:
-        print("CRITICAL ERROR:", e)
-        return []
+    return DATA_CACHE
+``
