@@ -1,30 +1,5 @@
 # ============================================================
-# GP ACTIVITY ENGINE - FULL PIPELINED SYSTEM (500+ LINES)
-# ============================================================
-
-# =========================
-# IMPORTS
-# =========================
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-import asyncio
-import aiohttp
-import feedparser
-
-import re
-import time
-
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
-
-
-# =========================
-# APP INIT
-# =========================
-
-app = FastAPI()
+# GP ACTIVITY ENGINE - FULL PIPELINED SYSTEM (ST FastAPI()# GP ACTIVITY ENGINE - FULL PIPELINED SYSTEM (STABLE VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,7 +29,6 @@ KEYWORDS = [
     "vehicle"
 ]
 
-# ENGINE TIMING (SLOWED DOWN DELIBERATELY)
 STEP_DELAY = 1.5
 ENGINE_LOOP_DELAY = 2.5
 
@@ -62,6 +36,21 @@ RSS_REFRESH_INTERVAL = 120
 REGISTRY_REFRESH_INTERVAL = 60
 
 MAX_EVENTS_MEMORY = 200
+
+
+# ============================================================
+# RESPONSE CACHE + RATE LIMIT (ADDED)
+# ============================================================
+
+RESPONSE_CACHE = {
+    "data": [],
+    "timestamp": 0
+}
+
+RESPONSE_TTL = 5
+
+LAST_REQUEST_TIME = 0
+MIN_REQUEST_INTERVAL = 0.2
 
 
 # ============================================================
@@ -132,7 +121,6 @@ class Event:
     def to_dict(self) -> Dict:
         return {
             "title": self.title,
-            "text": self.text,
             "url": self.url,
             "source": self.source,
             "timestamp": self.timestamp.isoformat()
@@ -185,12 +173,15 @@ class EngineState:
             "registry": SourceState()
         }
 
+        # ✅ PRECOMPUTED GROUP DATA
+        self.grouped: List[Dict] = []
+
 
 STATE = EngineState()
 
 
 # ============================================================
-# SOURCE CONTROL (CIRCUIT BREAKER)
+# SOURCE CONTROL
 # ============================================================
 
 def can_run_source(name: str) -> bool:
@@ -238,7 +229,7 @@ def scheduler_cycle():
 
 
 # ============================================================
-# RSS HANDLER
+# TASK HANDLERS
 # ============================================================
 
 async def run_rss_task(task: Task):
@@ -256,13 +247,7 @@ async def run_rss_task(task: Task):
             if not is_valid(text):
                 continue
 
-            event = Event(
-                entry.title,
-                text,
-                entry.link,
-                "NEWS"
-            )
-
+            event = Event(entry.title, text, entry.link, "NEWS")
             STATE.events.append(event)
 
         record_success("rss")
@@ -272,17 +257,12 @@ async def run_rss_task(task: Task):
         record_failure("rss")
 
 
-# ============================================================
-# REGISTRY HANDLER
-# ============================================================
-
 async def run_registry_task():
 
     if not can_run_source("registry"):
         return
 
     try:
-
         async with aiohttp.ClientSession() as session:
 
             async with session.get(
@@ -340,24 +320,19 @@ async def execute_next_task():
 
 
 # ============================================================
-# DATA PROCESSING PIPELINE
+# DATA PIPELINE
 # ============================================================
 
 def prune_old_events():
-
-    STATE.events = [
-        e for e in STATE.events if within_48h(e.timestamp)
-    ]
+    STATE.events = [e for e in STATE.events if within_48h(e.timestamp)]
 
 
 def deduplicate_events():
-
     seen = set()
     unique = []
 
     for e in STATE.events:
         key = e.title[:80]
-
         if key not in seen:
             seen.add(key)
             unique.append(e)
@@ -388,12 +363,14 @@ def aggregate_events():
                 "activity_count": 0
             }
 
-        grouped[entity]["events"].append({
-            "title": e.title,
-            "url": e.url,
-            "source": e.source,
-            "event_type": classify(e.text)
-        })
+        # ✅ LIMIT PAYLOAD SIZE
+        if len(grouped[entity]["events"]) < 5:
+            grouped[entity]["events"].append({
+                "title": e.title,
+                "url": e.url,
+                "source": e.source,
+                "event_type": classify(e.text)
+            })
 
         grouped[entity]["activity_count"] += 1
 
@@ -409,26 +386,31 @@ async def engine_loop():
     while True:
 
         try:
-
-            # 1. schedule
             scheduler_cycle()
 
-            # 2. execute ONE task only
             await execute_next_task()
 
-            # 3. pipeline cleanup
             prune_old_events()
             deduplicate_events()
             enforce_memory_limit()
 
-            # 4. metrics update
             STATE.metrics["cycles"] += 1
             STATE.metrics["events_total"] = len(STATE.events)
+
+            # ✅ PRECOMPUTE GROUP DATA
+            try:
+                STATE.grouped = aggregate_events()
+            except Exception as e:
+                STATE.errors["group"] = str(e)
 
         except Exception as e:
             STATE.errors["engine"] = str(e)
 
-        await asyncio.sleep(STEP_DELAY)
+        # ✅ ADAPTIVE DELAY
+        if STATE.queue:
+            await asyncio.sleep(STEP_DELAY)
+        else:
+            await asyncio.sleep(STEP_DELAY * 2)
 
 
 # ============================================================
@@ -441,7 +423,7 @@ async def start_engine():
 
 
 # ============================================================
-# API LAYER
+# API
 # ============================================================
 
 @app.get("/")
@@ -456,4 +438,49 @@ def root():
 
 @app.get("/events")
 def events():
-    return aggregate_events()
+
+    global LAST_REQUEST_TIME
+
+    current = time.time()
+
+    # ✅ RATE LIMIT
+    if current - LAST_REQUEST_TIME < MIN_REQUEST_INTERVAL:
+        return RESPONSE_CACHE["data"]
+
+    LAST_REQUEST_TIME = current
+
+    # ✅ CACHE HIT
+    if current - RESPONSE_CACHE["timestamp"] < RESPONSE_TTL:
+        return RESPONSE_CACHE["data"]
+
+    # ✅ RETURN PRECOMPUTED DATA
+    data = STATE.grouped
+
+    RESPONSE_CACHE["data"] = data
+    RESPONSE_CACHE["timestamp"] = current
+
+    return data
+# ============================================================
+
+# =========================
+# IMPORTS
+# =========================
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+import asyncio
+import aiohttp
+import feedparser
+
+import re
+import time
+
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+
+
+# =========================
+# APP INIT
+# =========================
+
