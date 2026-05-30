@@ -1,3 +1,4 @@
-fastapi
-uvicorn
-feedparser
+fastapi==0.111.0
+uvicorn==0.30.0
+aiohttp==3.9.5
+feedparser==6.0.11
